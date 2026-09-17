@@ -1,0 +1,12 @@
+<script lang="ts">
+  import AppShell from '$lib/components/AppShell.svelte';
+  const decks = [{ name: 'Dark Magician', cards: 40, color: 'red' }, { name: 'Blue-Eyes Control', cards: 42, color: 'green' }];
+</script>
+<svelte:head><title>Mis decks | Duel Assistant</title></svelte:head>
+<AppShell active="decks">
+  <header class="page-head"><div><p class="eyebrow">Biblioteca personal</p><h1>Mis decks<span>.</span></h1></div><a class="create" href="/decks">＋ Nuevo deck</a></header>
+  <section class="deck-grid">{#each decks as deck}<article class="deck {deck.color}"><div class="deck-art">DA</div><div class="deck-info"><span>Deck principal</span><h2>{deck.name}</h2><p>{deck.cards} cartas · actualizado hoy</p><a href="/decks">Abrir deck →</a></div></article>{/each}<article class="empty"><span>＋</span><strong>Crear un deck</strong><small>Importa cartas desde YGOProDeck</small></article></section>
+</AppShell>
+<style>
+.content{background:#f2f3ed}.page-head{display:flex;justify-content:space-between;align-items:end;margin-bottom:38px}.page-head h1{font-size:clamp(44px,6vw,76px);letter-spacing:-.08em;margin:8px 0}.page-head h1 span{color:#d9573b}.eyebrow{color:#d9573b;font:11px 'DM Mono',monospace;text-transform:uppercase;letter-spacing:.08em}.create{background:#17211b;color:#fff;padding:14px 18px;font-size:13px}.deck-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;max-width:900px}.deck{min-height:260px;display:flex;flex-direction:column;justify-content:space-between;padding:20px;color:#fff;background:#17211b;overflow:hidden;position:relative}.deck.green{background:#345847}.deck-art{font:700 100px 'DM Mono',monospace;color:#ffffff24;position:absolute;right:-8px;top:-14px;letter-spacing:-.15em}.deck-info{position:relative}.deck-info>span{font:10px 'DM Mono',monospace;text-transform:uppercase;color:#b2c8b2}.deck h2{font-size:28px;letter-spacing:-.06em;margin:65px 0 5px}.deck p{color:#b2c8b2;font-size:12px}.deck a{display:inline-block;color:#f2bd72;margin-top:17px;font:11px 'DM Mono',monospace}.empty{min-height:260px;border:1px dashed #c5d0c3;display:flex;flex-direction:column;justify-content:center;align-items:center;color:#637064}.empty span{font-size:35px;color:#d9573b}.empty strong{margin:10px 0 5px}.empty small{font:10px 'DM Mono',monospace}@media(max-width:720px){.page-head{align-items:start;gap:20px;flex-direction:column}.deck-grid{grid-template-columns:1fr}}
+</style>
