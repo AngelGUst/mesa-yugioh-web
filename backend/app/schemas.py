@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -45,12 +46,33 @@ class CardResponse(BaseModel):
     level: int | None
     race: str | None
     attribute: str | None
+    human_readable_card_type: str | None
+    frame_type: str | None
+    archetype: str | None
+    ygoprodeck_url: str | None
     image_url: str | None
+    image_url_small: str | None
+    image_url_cropped: str | None
+    prints: list["CardPrintResponse"] = []
+
+
+class CardPrintResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    set_name: str
+    set_code: str
+    language: str | None
+    rarity: str | None
+    rarity_code: str | None
+    price: str | None
 
 
 class DeckCardInput(BaseModel):
     card_id: int
     quantity: int = Field(default=1, ge=1, le=3)
+    section: Literal["main", "extra", "side"] = "main"
+    preferred_print_id: int | None = None
 
 
 class DeckCreate(BaseModel):
@@ -66,7 +88,11 @@ class DeckUpdate(BaseModel):
 
 
 class DeckCardResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     quantity: int
+    section: Literal["main", "extra", "side"]
+    preferred_print_id: int | None
     card: CardResponse
 
 
@@ -83,11 +109,16 @@ class DeckResponse(BaseModel):
 
 
 class DuelCreate(BaseModel):
-    player2_id: int | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    deck_id: int | None = None
+
+
+class DuelJoin(BaseModel):
+    duel_code: str = Field(min_length=4, max_length=20)
+    deck_id: int | None = None
 
 
 class DuelUpdate(BaseModel):
-    player2_id: int | None = None
     player1_lp: int | None = Field(default=None, ge=0, le=99999)
     player2_lp: int | None = Field(default=None, ge=0, le=99999)
     status: str | None = Field(default=None, pattern="^(waiting|active|finished)$")
@@ -116,8 +147,13 @@ class DuelResponse(BaseModel):
 
     id: int
     duel_code: str
+    name: str | None
     player1_id: int
     player2_id: int | None
+    player1_username: str
+    player2_username: str | None
+    player1_deck_id: int | None
+    player2_deck_id: int | None
     player1_lp: int
     player2_lp: int
     status: str

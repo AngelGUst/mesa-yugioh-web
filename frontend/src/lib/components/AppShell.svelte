@@ -1,5 +1,14 @@
 <script lang="ts">
+  import { goto } from '$app/navigation';
+
   export let active = 'home';
+  export let username = 'Jugador';
+  export let isAdmin = false;
+
+  function logout() {
+    localStorage.removeItem('duel_session');
+    goto('/login');
+  }
 </script>
 
 <div class="app-shell">
@@ -15,7 +24,7 @@
       <a class:active={active === 'decks'} href="/decks">▣ <span>Mis decks</span></a>
     </nav>
     <div class="side-spacer"></div>
-    <div class="profile-mini"><span class="avatar">A</span><span><b>angel</b><small>Jugador local</small></span><a href="/login" aria-label="Salir">↗</a></div>
+    <div class="profile-mini"><span class="avatar">{username.slice(0, 1).toUpperCase()}</span><span><b>{username}</b><small>{isAdmin ? 'Administrador' : 'Jugador'}</small></span><button on:click={logout} aria-label="Salir">↗</button></div>
   </aside>
   <main class="content"><slot /></main>
 </div>

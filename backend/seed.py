@@ -7,7 +7,7 @@ from app.db import SessionLocal, ensure_schema as db_ensure_schema
 from app.models import Player
 
 ADMIN_USERNAME = "Mr_Ganzo"
-ADMIN_EMAIL = "mr_ganzo@duel-assistant.local"
+ADMIN_EMAIL = "mr_ganzo@example.com"
 ADMIN_PASSWORD = "adminGanzo"
 
 

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import create_access_token, get_current_player, hash_password, verify_password
 from app.db import ensure_schema, get_db
-from app.models import Card, Deck, DeckCard, Duel, DuelEvent, Player
+from app.models import Card, CardPrint, Deck, DeckCard, Duel, DuelEvent, Player
 from app.schemas import (
     CardResponse,
     DeckCreate,
@@ -18,6 +18,7 @@ from app.schemas import (
     DuelCreate,
     DuelEventCreate,
     DuelEventResponse,
+    DuelJoin,
     DuelResponse,
     DuelUpdate,
     PlayerCreate,
@@ -25,7 +26,7 @@ from app.schemas import (
     PlayerResponse,
     TokenResponse,
 )
-from app.ygoprodeck import YGOProDeckError, fetch_cards, to_card_values
+from app.ygoprodeck import YGOProDeckError, fetch_cards, to_card_print_values, to_card_values
 from config import settings
 
 
@@ -102,12 +103,30 @@ def import_cards(
             values = to_card_values(raw_card)
             card = db.scalar(select(Card).where(Card.ygoprodeck_id == values["ygoprodeck_id"]))
             if card is None:
-                db.add(Card(**values))
+                card = Card(**values)
+                db.add(card)
                 imported += 1
             else:
                 for field, value in values.items():
                     setattr(card, field, value)
                 updated += 1
+            db.flush()
+            imported_print_codes = set()
+            for raw_print in raw_card.get("card_sets") or []:
+                print_values = to_card_print_values(raw_print)
+                imported_print_codes.add(print_values["set_code"])
+                card_print = db.scalar(
+                    select(CardPrint).where(CardPrint.card_id == card.id, CardPrint.set_code == print_values["set_code"])
+                )
+                if card_print is None:
+                    db.add(CardPrint(card_id=card.id, **print_values))
+                else:
+                    for field, value in print_values.items():
+                        setattr(card_print, field, value)
+            if imported_print_codes:
+                for card_print in card.prints:
+                    if card_print.set_code not in imported_print_codes:
+                        db.delete(card_print)
         db.commit()
     except YGOProDeckError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
@@ -116,11 +135,31 @@ def import_cards(
 
 def _replace_deck_cards(deck: Deck, card_inputs: list, db: Session) -> None:
     card_ids = [item.card_id for item in card_inputs]
+    if len(card_ids) != len(set(card_ids)):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Una carta solo puede aparecer una vez por deck")
     cards_by_id = {card.id: card for card in db.scalars(select(Card).where(Card.id.in_(card_ids))).all()}
     if len(cards_by_id) != len(set(card_ids)):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Una o mas cartas no existen")
+    print_ids = [item.preferred_print_id for item in card_inputs if item.preferred_print_id is not None]
+    prints_by_id = {card_print.id: card_print for card_print in db.scalars(select(CardPrint).where(CardPrint.id.in_(print_ids))).all()}
+    for item in card_inputs:
+        if item.preferred_print_id is not None:
+            card_print = prints_by_id.get(item.preferred_print_id)
+            if card_print is None or card_print.card_id != item.card_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="La impresion seleccionada no pertenece a la carta",
+                )
     deck.card_entries.clear()
-    deck.card_entries.extend(DeckCard(card_id=item.card_id, quantity=item.quantity) for item in card_inputs)
+    deck.card_entries.extend(
+        DeckCard(
+            card_id=item.card_id,
+            quantity=item.quantity,
+            section=item.section,
+            preferred_print_id=item.preferred_print_id,
+        )
+        for item in card_inputs
+    )
 
 
 @app.post("/api/decks", response_model=DeckResponse, status_code=status.HTTP_201_CREATED)
@@ -181,16 +220,39 @@ def _duel_for_player(duel_id: int, player: Player, db: Session) -> Duel:
     return duel
 
 
+def _owned_deck_or_none(deck_id: int | None, player: Player, db: Session) -> int | None:
+    if deck_id is None:
+        return None
+    _owned_deck(deck_id, player, db)
+    return deck_id
+
+
 @app.post("/api/duels", response_model=DuelResponse, status_code=status.HTTP_201_CREATED)
 def create_duel(payload: DuelCreate, player: Player = Depends(get_current_player), db: Session = Depends(get_db)) -> Duel:
-    if payload.player2_id == player.id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No puedes desafiarte a ti mismo")
-    if payload.player2_id is not None and db.get(Player, payload.player2_id) is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Oponente no encontrado")
-    duel = Duel(duel_code=uuid4().hex[:10].upper(), player1_id=player.id, player2_id=payload.player2_id)
-    if payload.player2_id is not None:
-        duel.status = "active"
+    duel = Duel(
+        duel_code=uuid4().hex[:10].upper(),
+        name=payload.name,
+        player1_id=player.id,
+        player1_deck_id=_owned_deck_or_none(payload.deck_id, player, db),
+    )
     db.add(duel)
+    db.commit()
+    db.refresh(duel)
+    return duel
+
+
+@app.post("/api/duels/join", response_model=DuelResponse)
+def join_duel(payload: DuelJoin, player: Player = Depends(get_current_player), db: Session = Depends(get_db)) -> Duel:
+    duel = db.scalar(select(Duel).where(Duel.duel_code == payload.duel_code.upper()))
+    if duel is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sala no encontrada")
+    if duel.player1_id == player.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ya eres el creador de esta sala")
+    if duel.player2_id is not None or duel.status != "waiting":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La sala ya no esta disponible")
+    duel.player2_id = player.id
+    duel.player2_deck_id = _owned_deck_or_none(payload.deck_id, player, db)
+    duel.status = "active"
     db.commit()
     db.refresh(duel)
     return duel
@@ -210,12 +272,6 @@ def get_duel(duel_id: int, player: Player = Depends(get_current_player), db: Ses
 def update_duel(duel_id: int, payload: DuelUpdate, player: Player = Depends(get_current_player), db: Session = Depends(get_db)) -> Duel:
     duel = _duel_for_player(duel_id, player, db)
     changes = payload.model_dump(exclude_unset=True)
-    if "player2_id" in changes and changes["player2_id"] is not None:
-        if db.get(Player, changes["player2_id"]) is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Oponente no encontrado")
-        if changes["player2_id"] == duel.player1_id:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Oponente invalido")
-        changes["status"] = "active"
     for field, value in changes.items():
         setattr(duel, field, value)
     if duel.status == "finished" and duel.finished_at is None:
