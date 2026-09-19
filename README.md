@@ -35,15 +35,15 @@ npm run dev -- --open
 
 La interfaz queda disponible en `http://localhost:5173`.
 
-PostgreSQL queda publicado para herramientas externas como DataGrip en `localhost:5433`.
-
 ## Docker
 
 ```powershell
+$env:SECRET_KEY = py -c "import secrets; print(secrets.token_urlsafe(32))"
+$env:POSTGRES_PASSWORD = py -c "import secrets; print(secrets.token_urlsafe(32))"
 docker compose up --build
 ```
 
-Esto inicia PostgreSQL, backend y frontend.
+Esto inicia PostgreSQL, backend y frontend. `SECRET_KEY` y `POSTGRES_PASSWORD` son obligatorias: use valores diferentes, aleatorios y de al menos 32 caracteres. Puede copiar `.env.example` a `.env` para documentar la configuración, pero debe completar ambos valores antes de iniciar los contenedores. PostgreSQL no expone un puerto al host; backend se conecta mediante la red interna de Docker.
 
 ## CLI de desarrollo
 
