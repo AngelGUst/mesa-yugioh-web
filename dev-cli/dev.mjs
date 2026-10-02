@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +12,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const IS_WIN = process.platform === 'win32';
 const REQUIRED = 'backend';
 const children = [];
+const developmentSecret = process.env.SECRET_KEY || randomBytes(32).toString('hex');
 
 const SERVICES = {
   backend: {
@@ -80,7 +82,12 @@ function runOnce(command, args, cwd, tag) {
 function launchService(key) {
   const service = SERVICES[key];
   const prefix = paintFor(service.color)(`[${key}]`);
-  const child = spawnProcess(service.command, service.args, { cwd: join(ROOT, service.dir) });
+  const env = { ...process.env };
+  if (key === 'backend' && !env.SECRET_KEY) {
+    env.SECRET_KEY = developmentSecret;
+    console.log(chalk.yellow(`${prefix} SECRET_KEY temporal generado para esta sesión. Configura backend/.env para usar una clave persistente.`));
+  }
+  const child = spawnProcess(service.command, service.args, { cwd: join(ROOT, service.dir), env });
   child.stdout.on('data', (data) => process.stdout.write(prefixChunk(prefix, data)));
   child.stderr.on('data', (data) => process.stderr.write(prefixChunk(prefix, data)));
   child.on('exit', (code) => console.log(`${prefix} ${chalk.yellow(`terminado (${code ?? 'sin codigo'})`)}`));

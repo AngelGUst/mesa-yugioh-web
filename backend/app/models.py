@@ -66,7 +66,9 @@ class Card(Base):
 
 class CardPrint(Base):
     __tablename__ = "card_prints"
-    __table_args__ = (UniqueConstraint("card_id", "set_code", name="uq_card_print_set_code"),)
+    __table_args__ = (
+        UniqueConstraint("card_id", "set_code", "rarity_code", "rarity", name="uq_card_print_identity"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     card_id: Mapped[int] = mapped_column(ForeignKey("cards.id", ondelete="CASCADE"), index=True)

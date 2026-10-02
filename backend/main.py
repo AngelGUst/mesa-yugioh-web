@@ -1,18 +1,28 @@
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import json
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.auth import create_access_token, get_current_player, hash_password, verify_password
+from app.auth import (
+    create_access_token,
+    decode_token_player_id,
+    get_current_player,
+    hash_password,
+    verify_password,
+)
 from app.db import ensure_schema, get_db
 from app.models import Card, CardPrint, Deck, DeckCard, Duel, DuelEvent, Player
+from app.websocket_manager import ws_manager
 from app.schemas import (
     CardResponse,
     DeckCreate,
+    DeckImportRequest,
     DeckResponse,
     DeckUpdate,
     DuelCreate,
@@ -26,13 +36,21 @@ from app.schemas import (
     PlayerResponse,
     TokenResponse,
 )
-from app.ygoprodeck import YGOProDeckError, fetch_cards, to_card_print_values, to_card_values
+from app.ygoprodeck import (
+    YGOProDeckError,
+    fetch_cards,
+    fetch_cards_by_ids,
+    parse_deck_content,
+    to_card_print_values,
+    to_card_values,
+)
 from config import settings
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     ensure_schema()
+    ws_manager.set_loop(asyncio.get_running_loop())
     yield
 
 
@@ -111,22 +129,30 @@ def import_cards(
                     setattr(card, field, value)
                 updated += 1
             db.flush()
-            imported_print_codes = set()
+            existing_prints = {
+                (card_print.set_code, card_print.rarity_code, card_print.rarity): card_print
+                for card_print in card.prints
+            }
+            imported_print_identities = set()
             for raw_print in raw_card.get("card_sets") or []:
                 print_values = to_card_print_values(raw_print)
-                imported_print_codes.add(print_values["set_code"])
-                card_print = db.scalar(
-                    select(CardPrint).where(CardPrint.card_id == card.id, CardPrint.set_code == print_values["set_code"])
+                print_identity = (
+                    print_values["set_code"],
+                    print_values["rarity_code"],
+                    print_values["rarity"],
                 )
+                imported_print_identities.add(print_identity)
+                card_print = existing_prints.get(print_identity)
                 if card_print is None:
-                    db.add(CardPrint(card_id=card.id, **print_values))
+                    card_print = CardPrint(card_id=card.id, **print_values)
+                    db.add(card_print)
+                    existing_prints[print_identity] = card_print
                 else:
                     for field, value in print_values.items():
                         setattr(card_print, field, value)
-            if imported_print_codes:
-                for card_print in card.prints:
-                    if card_print.set_code not in imported_print_codes:
-                        db.delete(card_print)
+            for print_identity, card_print in existing_prints.items():
+                if print_identity not in imported_print_identities:
+                    db.delete(card_print)
         db.commit()
     except YGOProDeckError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
@@ -150,16 +176,33 @@ def _replace_deck_cards(deck: Deck, card_inputs: list, db: Session) -> None:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="La impresion seleccionada no pertenece a la carta",
                 )
-    deck.card_entries.clear()
-    deck.card_entries.extend(
-        DeckCard(
-            card_id=item.card_id,
-            quantity=item.quantity,
-            section=item.section,
-            preferred_print_id=item.preferred_print_id,
-        )
-        for item in card_inputs
-    )
+    existing_by_card_id = {entry.card_id: entry for entry in deck.card_entries}
+    input_card_ids = set()
+    new_entries = []
+
+    for item in card_inputs:
+        input_card_ids.add(item.card_id)
+        if item.card_id in existing_by_card_id:
+            entry = existing_by_card_id[item.card_id]
+            entry.quantity = item.quantity
+            entry.section = item.section
+            entry.preferred_print_id = item.preferred_print_id
+            new_entries.append(entry)
+        else:
+            new_entries.append(
+                DeckCard(
+                    card_id=item.card_id,
+                    quantity=item.quantity,
+                    section=item.section,
+                    preferred_print_id=item.preferred_print_id,
+                )
+            )
+
+    for card_id, entry in existing_by_card_id.items():
+        if card_id not in input_card_ids:
+            db.delete(entry)
+
+    deck.card_entries = new_entries
 
 
 @app.post("/api/decks", response_model=DeckResponse, status_code=status.HTTP_201_CREATED)
@@ -203,20 +246,142 @@ def update_deck(deck_id: int, payload: DeckUpdate, player: Player = Depends(get_
     return deck
 
 
+@app.post("/api/decks/import", response_model=DeckResponse, status_code=status.HTTP_201_CREATED)
+def import_deck(
+    payload: DeckImportRequest,
+    player: Player = Depends(get_current_player),
+    db: Session = Depends(get_db),
+) -> Deck:
+    try:
+        detected_name, sections = parse_deck_content(payload.content)
+    except YGOProDeckError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    deck_name = payload.name or detected_name or "Deck Importado"
+
+    all_refs = list(sections["main"] + sections["extra"] + sections["side"])
+    numeric_ids = {int(ref) for ref in all_refs if isinstance(ref, int) or (isinstance(ref, str) and ref.isdigit())}
+    name_refs = {str(ref) for ref in all_refs if isinstance(ref, str) and not ref.isdigit()}
+
+    # 1. Look up existing cards
+    existing_cards_by_ygo_id = {}
+    if numeric_ids:
+        for card in db.scalars(select(Card).where(Card.ygoprodeck_id.in_(numeric_ids))).all():
+            existing_cards_by_ygo_id[card.ygoprodeck_id] = card
+
+    existing_cards_by_name = {}
+    if name_refs:
+        for card in db.scalars(select(Card).where(Card.name.in_(name_refs))).all():
+            existing_cards_by_name[card.name.lower()] = card
+
+    # 2. Fetch missing cards by ID
+    missing_numeric_ids = list(numeric_ids - set(existing_cards_by_ygo_id.keys()))
+    if missing_numeric_ids:
+        try:
+            fetched = fetch_cards_by_ids(missing_numeric_ids)
+            for raw_card in fetched:
+                card_vals = to_card_values(raw_card)
+                card = Card(**card_vals)
+                db.add(card)
+                db.flush()
+                for raw_print in raw_card.get("card_sets") or []:
+                    print_vals = to_card_print_values(raw_print)
+                    db.add(CardPrint(card_id=card.id, **print_vals))
+                existing_cards_by_ygo_id[card.ygoprodeck_id] = card
+                existing_cards_by_name[card.name.lower()] = card
+        except YGOProDeckError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    # 3. Fetch missing cards by Name
+    for name_ref in name_refs:
+        if name_ref.lower() not in existing_cards_by_name:
+            try:
+                fetched = fetch_cards(name_ref)
+                for raw_card in fetched:
+                    if raw_card["name"].lower() == name_ref.lower():
+                        card_vals = to_card_values(raw_card)
+                        card = Card(**card_vals)
+                        db.add(card)
+                        db.flush()
+                        for raw_print in raw_card.get("card_sets") or []:
+                            print_vals = to_card_print_values(raw_print)
+                            db.add(CardPrint(card_id=card.id, **print_vals))
+                        existing_cards_by_ygo_id[card.ygoprodeck_id] = card
+                        existing_cards_by_name[card.name.lower()] = card
+                        break
+            except Exception:
+                pass
+
+    def resolve_card(ref: int | str) -> Card | None:
+        if isinstance(ref, int) or (isinstance(ref, str) and ref.isdigit()):
+            return existing_cards_by_ygo_id.get(int(ref))
+        return existing_cards_by_name.get(str(ref).lower())
+
+    deck = Deck(
+        name=deck_name,
+        description=payload.description or "Importado automáticamente",
+        player_id=player.id,
+    )
+    db.add(deck)
+    db.flush()
+
+    seen_cards = {}
+    for section_name in ["main", "extra", "side"]:
+        raw_items = sections.get(section_name) or []
+        counts = {}
+        for item in raw_items:
+            card = resolve_card(item)
+            if card:
+                counts[card.id] = counts.get(card.id, 0) + 1
+
+        for card_id, count in counts.items():
+            qty = min(3, count)
+            if card_id not in seen_cards:
+                preferred_print = db.scalar(select(CardPrint.id).where(CardPrint.card_id == card_id).limit(1))
+                entry = DeckCard(
+                    deck_id=deck.id,
+                    card_id=card_id,
+                    quantity=qty,
+                    section=section_name,
+                    preferred_print_id=preferred_print,
+                )
+                db.add(entry)
+                seen_cards[card_id] = entry
+            else:
+                existing_entry = seen_cards[card_id]
+                existing_entry.quantity = min(3, existing_entry.quantity + qty)
+
+    db.commit()
+    db.refresh(deck)
+    return deck
+
+
 @app.delete("/api/decks/{deck_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_deck(deck_id: int, player: Player = Depends(get_current_player), db: Session = Depends(get_db)) -> None:
     deck = _owned_deck(deck_id, player, db)
+    referenced_duel = db.scalar(select(Duel.id).where(
+        (Duel.player1_deck_id == deck.id) | (Duel.player2_deck_id == deck.id)
+    ))
+    if referenced_duel is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No puedes eliminar un deck seleccionado en un duelo. Elimina el duelo primero.",
+        )
     db.delete(deck)
     db.commit()
 
 
-def _duel_for_player(duel_id: int, player: Player, db: Session) -> Duel:
-    duel = db.scalar(select(Duel).where(
-        Duel.id == duel_id,
-        (Duel.player1_id == player.id) | (Duel.player2_id == player.id),
-    ))
+def _duel_viewable(duel_id: int, db: Session) -> Duel:
+    duel = db.scalar(select(Duel).where(Duel.id == duel_id))
     if duel is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Duelo no encontrado")
+    return duel
+
+
+def _duel_for_player(duel_id: int, player: Player, db: Session) -> Duel:
+    duel = _duel_viewable(duel_id, db)
+    if duel.player1_id != player.id and duel.player2_id != player.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tienes permisos de jugador en este duelo")
     return duel
 
 
@@ -255,6 +420,11 @@ def join_duel(payload: DuelJoin, player: Player = Depends(get_current_player), d
     duel.status = "active"
     db.commit()
     db.refresh(duel)
+
+    ws_manager.broadcast_sync(duel.id, {
+        "type": "DUEL_UPDATED",
+        "duel": DuelResponse.model_validate(duel).model_dump(mode="json"),
+    })
     return duel
 
 
@@ -265,7 +435,7 @@ def list_duels(player: Player = Depends(get_current_player), db: Session = Depen
 
 @app.get("/api/duels/{duel_id}", response_model=DuelResponse)
 def get_duel(duel_id: int, player: Player = Depends(get_current_player), db: Session = Depends(get_db)) -> Duel:
-    return _duel_for_player(duel_id, player, db)
+    return _duel_viewable(duel_id, db)
 
 
 @app.put("/api/duels/{duel_id}", response_model=DuelResponse)
@@ -278,6 +448,11 @@ def update_duel(duel_id: int, payload: DuelUpdate, player: Player = Depends(get_
         duel.finished_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(duel)
+
+    ws_manager.broadcast_sync(duel.id, {
+        "type": "DUEL_UPDATED",
+        "duel": DuelResponse.model_validate(duel).model_dump(mode="json"),
+    })
     return duel
 
 
@@ -295,4 +470,50 @@ def add_duel_event(duel_id: int, payload: DuelEventCreate, player: Player = Depe
     db.add(event)
     db.commit()
     db.refresh(event)
+
+    ws_manager.broadcast_sync(duel.id, {
+        "type": "DUEL_EVENT",
+        "event": DuelEventResponse.model_validate(event).model_dump(mode="json"),
+    })
     return event
+
+
+@app.websocket("/api/duels/{duel_id}/ws")
+async def duel_websocket(
+    websocket: WebSocket,
+    duel_id: int,
+    token: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    duel = db.scalar(select(Duel).where(Duel.id == duel_id))
+    if duel is None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    player_id = decode_token_player_id(token)
+    role = "spectator"
+    if player_id is not None and (duel.player1_id == player_id or duel.player2_id == player_id):
+        role = "player"
+
+    await ws_manager.connect(duel_id, websocket)
+
+    await websocket.send_json({
+        "type": "CONNECTED",
+        "duel_id": duel_id,
+        "role": role,
+        "player_id": player_id,
+    })
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                if msg.get("action") == "PING":
+                    await websocket.send_json({"type": "PONG"})
+            except Exception:
+                pass
+    except WebSocketDisconnect:
+        ws_manager.disconnect(duel_id, websocket)
+    except Exception:
+        ws_manager.disconnect(duel_id, websocket)

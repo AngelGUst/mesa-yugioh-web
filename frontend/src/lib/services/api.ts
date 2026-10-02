@@ -6,6 +6,19 @@ export function getSessionToken(): string | null {
   return localStorage.getItem('duel_session');
 }
 
+export function connectDuelWebSocket(duelId: number | string): WebSocket {
+  const baseUrl = new URL(apiUrl, window.location.origin);
+  const socketUrl = new URL(`/api/duels/${duelId}/ws`, baseUrl.origin);
+  socketUrl.protocol = socketUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+
+  const token = getSessionToken();
+  if (token) {
+    socketUrl.searchParams.set('token', token);
+  }
+
+  return new WebSocket(socketUrl);
+}
+
 export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const token = getSessionToken();
   const headers = new Headers(init.headers);

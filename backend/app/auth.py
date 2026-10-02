@@ -28,6 +28,16 @@ def create_access_token(player_id: int) -> str:
     return jwt.encode({"sub": str(player_id), "exp": expires}, settings.secret_key, algorithm="HS256")
 
 
+def decode_token_player_id(token: str | None) -> int | None:
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+        return int(payload["sub"])
+    except (JWTError, KeyError, TypeError, ValueError):
+        return None
+
+
 def get_current_player(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: Session = Depends(get_db),

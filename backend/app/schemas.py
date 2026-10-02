@@ -87,9 +87,16 @@ class DeckUpdate(BaseModel):
     cards: list[DeckCardInput] | None = None
 
 
+class DeckImportRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=100)
+    description: str | None = Field(default=None, max_length=500)
+    content: str = Field(min_length=5, description="Código YDKe, archivo .YDK o JSON")
+
+
 class DeckCardResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    card_id: int
     quantity: int
     section: Literal["main", "extra", "side"]
     preferred_print_id: int | None

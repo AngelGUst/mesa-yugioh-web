@@ -18,6 +18,7 @@ class Base(DeclarativeBase):
 def ensure_schema() -> None:
     Base.metadata.create_all(bind=engine)
     with engine.begin() as connection:
+        _migrate_card_print_identity(connection)
         player_columns = {column["name"] for column in inspect(connection).get_columns("players")}
         if "is_admin" not in player_columns:
             connection.execute(text("ALTER TABLE players ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT FALSE"))
@@ -53,6 +54,46 @@ def ensure_schema() -> None:
         for column, column_type in duel_migrations.items():
             if column not in duel_columns:
                 connection.execute(text(f"ALTER TABLE duels ADD COLUMN {column} {column_type}"))
+
+
+def _migrate_card_print_identity(connection) -> None:
+    unique_constraints = inspect(connection).get_unique_constraints("card_prints")
+    if not any(constraint["name"] == "uq_card_print_set_code" for constraint in unique_constraints):
+        return
+
+    if connection.dialect.name == "postgresql":
+        connection.execute(text("ALTER TABLE card_prints DROP CONSTRAINT uq_card_print_set_code"))
+        connection.execute(text(
+            "ALTER TABLE card_prints ADD CONSTRAINT uq_card_print_identity "
+            "UNIQUE (card_id, set_code, rarity_code, rarity)"
+        ))
+        return
+
+    if connection.dialect.name == "sqlite":
+        connection.execute(text("""
+            CREATE TABLE card_prints_replacement (
+                id INTEGER NOT NULL PRIMARY KEY,
+                card_id INTEGER NOT NULL,
+                set_name VARCHAR(255) NOT NULL,
+                set_code VARCHAR(100) NOT NULL,
+                language VARCHAR(10),
+                rarity VARCHAR(100),
+                rarity_code VARCHAR(50),
+                price VARCHAR(50),
+                CONSTRAINT uq_card_print_identity UNIQUE (card_id, set_code, rarity_code, rarity),
+                FOREIGN KEY(card_id) REFERENCES cards (id) ON DELETE CASCADE
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO card_prints_replacement
+                (id, card_id, set_name, set_code, language, rarity, rarity_code, price)
+            SELECT id, card_id, set_name, set_code, language, rarity, rarity_code, price
+            FROM card_prints
+        """))
+        connection.execute(text("DROP TABLE card_prints"))
+        connection.execute(text("ALTER TABLE card_prints_replacement RENAME TO card_prints"))
+        connection.execute(text("CREATE INDEX ix_card_prints_card_id ON card_prints (card_id)"))
+        connection.execute(text("CREATE INDEX ix_card_prints_set_code ON card_prints (set_code)"))
 
 
 def get_db() -> Generator[Session, None, None]:

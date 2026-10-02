@@ -66,7 +66,7 @@
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || 'No fue posible unirse a la sala.');
-      await goto('/');
+      await goto(`/duel/${payload.id}`);
     } catch (caught) {
       error = caught instanceof Error ? caught.message : 'No fue posible unirse a la sala.';
     } finally {
@@ -84,7 +84,17 @@
     <label>Nombre de la sala<input bind:value={name} maxlength="100" placeholder="Duelo de viernes" /></label>
     <label>Deck para este duelo<select bind:value={deckId}><option value="">Sin deck seleccionado</option>{#each decks as deck (deck.id)}<option value={deck.id}>{deck.name} · {deck.card_entries.reduce((total, entry) => total + entry.quantity, 0)} cartas</option>{/each}</select></label>
     <button on:click={createRoom} disabled={isCreating}>{isCreating ? 'Creando...' : 'Crear sala'} <span>→</span></button>
-    {#if createdDuel}<div class="room-code"><small>Código para compartir</small><strong>{createdDuel.duel_code}</strong><button class="copy" on:click={() => navigator.clipboard?.writeText(createdDuel?.duel_code || '')}>Copiar código</button><a href="/">Ver mis salas →</a></div>{/if}
+    {#if createdDuel}
+      <div class="room-code">
+        <small>Código para compartir</small>
+        <strong>{createdDuel.duel_code}</strong>
+        <button class="copy" on:click={() => navigator.clipboard?.writeText(createdDuel?.duel_code || '')}>Copiar código</button>
+        <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 8px;">
+          <a href="/duel/{createdDuel.id}" style="color: #fff; background: #d9573b; padding: 10px; font-weight: bold; text-decoration: none;">Entrar a la mesa de duelo →</a>
+          <a href="/">Ver mis salas</a>
+        </div>
+      </div>
+    {/if}
     <div class="join"><div class="panel-head"><span>Unirse a una sala</span><span class="step">02 / 02</span></div><label>Código de sala<input bind:value={joinCode} maxlength="20" placeholder="AB12CD34EF" /></label><label>Deck para este duelo<select bind:value={joinDeckId}><option value="">Sin deck seleccionado</option>{#each decks as deck (deck.id)}<option value={deck.id}>{deck.name}</option>{/each}</select></label><button on:click={joinRoom} disabled={isJoining}>{isJoining ? 'Uniéndose...' : 'Unirse'} <span>→</span></button></div>
   </section></div></div>
 {/if}
