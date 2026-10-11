@@ -706,6 +706,7 @@
         <div><small class="eyebrow">Estado del tablero</small><h2>Cartas en zonas</h2></div>
         <span>{boardCards.length} registradas</span>
       </header>
+      <p class="board-debug">debug own={String(fieldOwnerId(true))} me={String(player?.id)}({typeof player?.id}) data={boardCards.map((c) => `${String(c.player_id)}(${typeof c.player_id})/${c.zone}/${String(c.position)}`).join(' | ') || 'vacío'}</p>
       {#if boardCards.length > 0}
         <div class="board-card-list">
           {#each boardCards as boardCard (boardCard.id)}
