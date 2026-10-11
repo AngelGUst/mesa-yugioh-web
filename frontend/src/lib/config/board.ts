@@ -60,3 +60,13 @@ export function cellAtMatPoint(xCm: number, yCm: number): { row: number; column:
   const row = Math.floor(yCm / CARD_HEIGHT_CM);
   return { row, column, cell: MAT_LAYOUT[row][column] };
 }
+
+export function matCellForZonePosition(zone: string, position: number): { row: number; column: number } | null {
+  for (let row = 0; row < MAT_LAYOUT.length; row++) {
+    for (let column = 0; column < MAT_LAYOUT[row].length; column++) {
+      const cell = MAT_LAYOUT[row][column];
+      if (cell && cell.zone === zone && cell.position === position) return { row, column };
+    }
+  }
+  return null;
+}

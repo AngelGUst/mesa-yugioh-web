@@ -3,7 +3,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { createWorker } from 'tesseract.js';
-  import { MAT_COLUMNS, MAT_ROWS, MAT_WIDTH_CM, MAT_HEIGHT_CM, cellAtMatPoint, slotsForZone } from '$lib/config/board';
+  import { MAT_COLUMNS, MAT_ROWS, MAT_WIDTH_CM, MAT_HEIGHT_CM, cellAtMatPoint, matCellForZonePosition, slotsForZone } from '$lib/config/board';
   import {
     cameraFetch,
     clearCameraToken,
@@ -89,6 +89,7 @@
   let previousCenters: Map<number, Point> | null = null;
   let lastAutoCaptureAt = 0;
   let lastAutoCellKey = '';
+  let lastBoardRefresh = 0;
   const AUTO_STABLE_FRAMES = 4;
   const AUTO_MOVE_TOLERANCE_PX = 6;
   const AUTO_COOLDOWN_MS = 4000;
@@ -253,12 +254,20 @@
         markerCount = points.size;
         missingMarkerNames = markerIds.filter((id) => !points.has(id)).map((id) => markerNames[id]);
         calibration = points.size === 4 ? calibrateMarkers(points, width, height) : null;
+        if (Date.now() - lastBoardRefresh > 5000 && !isCapturing && !isRecognizing && !capturedImage) {
+          lastBoardRefresh = Date.now();
+          loadCameraBoardCards().then((cards) => { boardCards = cards; }).catch(() => {});
+        }
+        const occupiedCells = boardCards
+          .filter((card) => card.position !== null && (card.zone === 'extra_monster' || card.player_id === session?.player_id))
+          .map((card) => matCellForZonePosition(card.zone, card.position ?? 0))
+          .filter((value): value is { row: number; column: number } => value !== null);
         cameraStatus = calibration
           ? 'Tapete calibrado. Mantén los cuatro marcadores visibles para escanear.'
           : points.size === 4
             ? 'Se ven los 4 marcadores, pero su geometría no permite calibrar.'
             : `Marcadores detectados: ${markerCount}/4`;
-        drawOverlay(overlayContext, width, height, detections, calibration);
+        drawOverlay(overlayContext, width, height, detections, calibration, occupiedCells);
         maybeAutoCapture(points, width, height);
       } catch (error) {
         cameraError = error instanceof Error ? error.message : 'Falló la detección de marcadores.';
@@ -357,7 +366,8 @@
     width: number,
     height: number,
     detections: AprilDetection[],
-    matrix: number[] | null
+    matrix: number[] | null,
+    occupiedCells: { row: number; column: number }[]
   ) {
     context.clearRect(0, 0, width, height);
     context.lineWidth = 2;
@@ -393,6 +403,16 @@
     for (let column = 1; column < MAT_COLUMNS; column++) {
       const u = column / MAT_COLUMNS; const top = projectPoint(matrix, u, 0); const bottom = projectPoint(matrix, u, 1);
       if (top && bottom) { context.beginPath(); context.moveTo(top.x, top.y); context.lineTo(bottom.x, bottom.y); context.stroke(); }
+    }
+    context.fillStyle = 'rgba(217, 83, 59, .32)';
+    for (const { row, column } of occupiedCells) {
+      const quad = [[column, row], [column + 1, row], [column + 1, row + 1], [column, row + 1]]
+        .map(([c, r]) => projectPoint(matrix, c / MAT_COLUMNS, r / MAT_ROWS));
+      if (quad.every((point) => point !== null)) {
+        context.beginPath();
+        quad.forEach((point, index) => index === 0 ? context.moveTo(point!.x, point!.y) : context.lineTo(point!.x, point!.y));
+        context.closePath(); context.fill();
+      }
     }
     const detected = detectCellAtCenter(matrix, width, height);
     if (detected) {
