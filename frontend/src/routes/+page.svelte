@@ -2,8 +2,8 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import AppShell from '$lib/components/AppShell.svelte';
+  import { apiUrl } from '$lib/services/api';
 
-  const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
   let isCheckingSession = true;
   let error = '';
   let player: Player | null = null;
@@ -21,6 +21,8 @@
   interface Duel {
     id: number;
     duel_code: string;
+    player1_username: string;
+    player2_username: string | null;
     player1_id: number;
     player2_id: number | null;
     player1_lp: number;
@@ -28,6 +30,7 @@
     status: 'waiting' | 'active' | 'finished';
     turn: number;
     current_phase: string;
+    viewer_role: 'player' | 'spectator';
   }
 
   interface Deck {
@@ -35,8 +38,9 @@
     card_entries: { quantity: number }[];
   }
 
-  $: activeDuels = duels.filter((duel) => duel.status === 'active');
-  $: waitingDuels = duels.filter((duel) => duel.status === 'waiting');
+  $: activeDuels = duels.filter((duel) => duel.status === 'active' && duel.viewer_role === 'player');
+  $: waitingDuels = duels.filter((duel) => duel.status === 'waiting' && duel.viewer_role === 'player');
+  $: spectatorDuels = duels.filter((duel) => duel.viewer_role === 'spectator' && duel.status !== 'finished');
   $: totalCards = decks.reduce(
     (total, deck) => total + deck.card_entries.reduce((deckTotal, entry) => deckTotal + entry.quantity, 0),
     0
@@ -137,6 +141,28 @@
           </a>
         {/each}
       </section>
+      {#if spectatorDuels.length > 0}
+        <div class="section-title"><h3>Partidas como espectador</h3></div>
+        <section class="duel-list">
+          {#each spectatorDuels as duel (duel.id)}
+            <a class="duel-card duel-link" href="/duel/{duel.id}">
+              <div class="card-top">
+                <span class="waiting">Solo lectura</span>
+                <small>Sala {duel.duel_code}</small>
+              </div>
+              <div class="match">
+                <div><strong>{duel.player1_username}</strong><b>{duel.player1_lp} LP</b></div>
+                <span>VS</span>
+                <div><strong>{duel.player2_username || 'Oponente'}</strong><b>{duel.player2_lp} LP</b></div>
+              </div>
+              <div class="card-bottom">
+                <span>Turno {duel.turn} · {duel.current_phase.replaceAll('_', ' ')}</span>
+                <span class="action-hint">Ver partida →</span>
+              </div>
+            </a>
+          {/each}
+        </section>
+      {/if}
       <div class="section-title"><h3>Resumen</h3><a href="/decks">Gestionar decks →</a></div>
       <section class="stats"><article><small>Victorias</small><strong>{player?.lp_wins ?? 0}</strong><span>Registradas en tu cuenta</span></article><article><small>Derrotas</small><strong>{player?.lp_losses ?? 0}</strong><span>Registradas en tu cuenta</span></article><article class="warm"><small>Mis decks</small><strong>{decks.length}</strong><span>{totalCards} cartas configuradas</span></article></section>
     {/if}

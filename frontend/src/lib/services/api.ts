@@ -1,6 +1,10 @@
 import { goto } from '$app/navigation';
 
-const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+export const apiUrl = import.meta.env.VITE_API_URL || (
+  import.meta.env.DEV || (typeof window !== 'undefined' && window.location.port === '5173')
+    ? 'http://localhost:8000'
+    : ''
+);
 
 export function getSessionToken(): string | null {
   return localStorage.getItem('duel_session');

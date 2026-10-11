@@ -1,7 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { apiUrl } from '$lib/services/api';
 
-  const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
   let username = '';
   let password = '';
   let error = '';

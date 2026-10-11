@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import QRCode from 'qrcode';
+  import { slotsForZone } from '$lib/config/board';
   import { page } from '$app/stores';
   import { apiFetch, connectDuelWebSocket, requireAuthenticatedUser } from '$lib/services/api';
 
@@ -12,6 +14,39 @@
     id: number;
     event_type: string;
     payload: Record<string, any> | null;
+    actor_player_id: number | null;
+    actor_username: string | null;
+    source_device: 'web' | 'camera';
+    card_id: number | null;
+    duel_card_id: number | null;
+    source_zone: string | null;
+    target_zone: string | null;
+    created_at: string;
+  }
+
+  interface DeckCardChoice {
+    card_id: number;
+    section: 'main' | 'extra' | 'side';
+    preferred_print_id: number | null;
+    card: { name: string };
+  }
+
+  interface DuelCard {
+    id: number;
+    card_id: number | null;
+    card_name: string;
+    player_id: number;
+    player_username: string;
+    zone: string;
+    position: number | null;
+    face_down: boolean;
+    hidden: boolean;
+  }
+
+  interface DuelSpectator {
+    player_id: number;
+    username: string;
+    invited_by_id: number;
     created_at: string;
   }
 
@@ -21,6 +56,8 @@
     name: string | null;
     player1_id: number;
     player2_id: number | null;
+    player1_deck_id: number | null;
+    player2_deck_id: number | null;
     player1_username: string;
     player2_username: string | null;
     player1_lp: number;
@@ -31,6 +68,8 @@
     current_player: number;
     winner_id: number | null;
     events: DuelEvent[];
+    revision: number;
+    viewer_role: 'player' | 'spectator';
   }
 
   let duelId = $page.params.id;
@@ -41,6 +80,37 @@
   let finished = false;
   let connectionStatus: 'connecting' | 'connected' | 'disconnected' = 'connecting';
   let logs: { turn: number; text: string }[] = [];
+  let lastRevision = 0;
+  let spectators: DuelSpectator[] = [];
+  let spectatorUsername = '';
+  let spectatorMessage = '';
+  let spectatorError = '';
+  let boardCards: DuelCard[] = [];
+  let deckChoices: DeckCardChoice[] = [];
+  let selectedCard = '';
+  let selectedZone = 'monster_zone';
+  let selectedPosition = '';
+  let selectedFaceDown = false;
+  let boardMessage = '';
+  let boardError = '';
+  let cameraPairingQr = '';
+  let cameraPairingUrl = '';
+  let cameraPairingExpiry = '';
+  let cameraPairingError = '';
+
+  const duelZones = [
+    { value: 'main_deck', label: 'Deck principal' },
+    { value: 'extra_deck', label: 'Deck extra' },
+    { value: 'side_deck', label: 'Side deck' },
+    { value: 'hand', label: 'Mano' },
+    { value: 'monster_zone', label: 'Zona de monstruos' },
+    { value: 'spell_trap_zone', label: 'Mágicas y trampas' },
+    { value: 'field_spell', label: 'Campo' },
+    { value: 'pendulum', label: 'Péndulo' },
+    { value: 'extra_monster', label: 'Monstruo extra' },
+    { value: 'graveyard', label: 'Cementerio' },
+    { value: 'banished', label: 'Destierro' }
+  ];
 
   const phases = [
     'DRAW PHASE',
@@ -52,10 +122,14 @@
   ];
 
   $: isPlayer1 = duel && player ? duel.player1_id === player.id : true;
+  $: isPlayer = duel && player ? duel.player1_id === player.id || duel.player2_id === player.id : false;
   $: myUsername = player?.username || 'Tú';
   $: opponentUsername = (isPlayer1 ? duel?.player2_username : duel?.player1_username) || 'Oponente';
   $: myLp = duel ? (isPlayer1 ? duel.player1_lp : duel.player2_lp) : 8000;
   $: opponentLp = duel ? (isPlayer1 ? duel.player2_lp : duel.player1_lp) : 8000;
+  $: firstPlayerLp = duel ? (isPlayer ? myLp : duel.player1_lp) : 8000;
+  $: secondPlayerLp = duel ? (isPlayer ? opponentLp : duel.player2_lp) : 8000;
+  $: zoneNeedsPosition = ['monster_zone', 'spell_trap_zone', 'extra_monster', 'pendulum'].includes(selectedZone);
   $: currentPhase = duel?.current_phase ? duel.current_phase.replaceAll('_', ' ') : 'DRAW PHASE';
   $: turn = duel?.turn || 1;
 
@@ -89,31 +163,24 @@
       socket.addEventListener('message', (message: MessageEvent<string>) => {
         try {
           const update = JSON.parse(message.data);
-          if (update.type === 'DUEL_UPDATED' && update.duel) {
-            const previousDuel = duel;
-            const updatedDuel = update.duel as Duel;
-            duel = updatedDuel;
-            finished = updatedDuel.status === 'finished';
-
-            if (previousDuel && previousDuel.current_phase !== updatedDuel.current_phase) {
-              logs = [{ turn: updatedDuel.turn, text: `Fase: ${updatedDuel.current_phase.replaceAll('_', ' ')}` }, ...logs];
-            } else if (previousDuel && previousDuel.turn !== updatedDuel.turn) {
-              logs = [{ turn: updatedDuel.turn, text: `Turno ${updatedDuel.turn}` }, ...logs];
-            }
+          const incomingRevision = Number(update.revision ?? update.duel?.revision);
+          if (update.type === 'DUEL_STATE' && update.duel) {
+            if (!Number.isFinite(incomingRevision) || incomingRevision < lastRevision) return;
+            applyDuelSnapshot(update.duel as Duel, incomingRevision);
+          } else if (update.type === 'DUEL_UPDATED' && update.duel) {
+            if (!Number.isFinite(incomingRevision) || incomingRevision <= lastRevision) return;
+            applyDuelSnapshot(update.duel as Duel, incomingRevision);
           } else if (update.type === 'DUEL_EVENT' && update.event) {
-            const duelEvent = update.event as DuelEvent;
-            const payload = duelEvent.payload || {};
-            const targetPlayerId = Number(payload.target_player_id);
-            const targetName = targetPlayerId === duel?.player1_id
-              ? duel.player1_username
-              : targetPlayerId === duel?.player2_id
-                ? duel.player2_username || 'Oponente'
-                : String(payload.target || 'duelo');
-            const eventText = duelEvent.event_type === 'LP_CHANGE'
-              ? `${targetName} ${Number(payload.delta) > 0 ? '+' : ''}${payload.delta} LP (${payload.new_lp})`
-              : `Evento: ${duelEvent.event_type.replaceAll('_', ' ')}`;
+            if (!Number.isFinite(incomingRevision) || incomingRevision <= lastRevision) return;
+            if (update.duel) {
+              applyDuelSnapshot(update.duel as Duel, incomingRevision);
+            } else {
+              lastRevision = incomingRevision;
+            }
 
-            logs = [{ turn: duel?.turn || 1, text: eventText }, ...logs];
+            const duelEvent = update.event as DuelEvent;
+            logs = [formatDuelEvent(duelEvent, duel), ...logs];
+            if (duelEvent.event_type.startsWith('CARD_')) void loadBoardCards();
           }
         } catch {}
       });
@@ -141,7 +208,11 @@
       if (!player || disposed) return;
       await loadDuel();
       isLoading = false;
-      if (!error) connect();
+      if (!error) {
+        await loadBoardCards();
+        if (isPlayer) await Promise.all([loadSpectators(), loadDeckChoices()]);
+        connect();
+      }
     }
 
     void initialize();
@@ -154,6 +225,40 @@
     };
   });
 
+  function applyDuelSnapshot(updatedDuel: Duel, revision: number, restoreHistory = false) {
+    const previousDuel = duel;
+    duel = updatedDuel;
+    lastRevision = revision;
+    finished = updatedDuel.status === 'finished';
+
+    if (restoreHistory) {
+      logs = [...updatedDuel.events]
+        .sort((left, right) => right.created_at.localeCompare(left.created_at))
+        .map((event) => formatDuelEvent(event, updatedDuel));
+    } else if (previousDuel && previousDuel.current_phase !== updatedDuel.current_phase) {
+      logs = [{ turn: updatedDuel.turn, text: `Fase: ${updatedDuel.current_phase.replaceAll('_', ' ')}` }, ...logs];
+    } else if (previousDuel && previousDuel.turn !== updatedDuel.turn) {
+      logs = [{ turn: updatedDuel.turn, text: `Turno ${updatedDuel.turn}` }, ...logs];
+    }
+  }
+
+  function formatDuelEvent(duelEvent: DuelEvent, currentDuel: Duel) {
+    const payload = duelEvent.payload || {};
+    const targetPlayerId = Number(payload.target_player_id);
+    const targetName = targetPlayerId === currentDuel.player1_id
+      ? currentDuel.player1_username
+      : targetPlayerId === currentDuel.player2_id
+        ? currentDuel.player2_username || 'Oponente'
+        : String(payload.target || 'duelo');
+    const eventText = duelEvent.event_type === 'LP_CHANGE'
+      ? `${targetName} ${Number(payload.delta) > 0 ? '+' : ''}${payload.delta} LP (${payload.new_lp})`
+      : duelEvent.event_type.startsWith('CARD_')
+        ? `${duelEvent.actor_username || 'Jugador'}: ${zoneLabel(duelEvent.source_zone)} → ${zoneLabel(duelEvent.target_zone)}`
+        : `Evento: ${duelEvent.event_type.replaceAll('_', ' ')}`;
+
+    return { turn: currentDuel.turn, text: eventText };
+  }
+
   async function loadDuel() {
     try {
       const res = await apiFetch(`/api/duels/${duelId}`);
@@ -162,16 +267,133 @@
         throw new Error(p.detail || 'No se pudo cargar el duelo.');
       }
       duel = await res.json();
+      lastRevision = duel.revision;
       if (duel?.status === 'finished') {
         finished = true;
       }
       if (duel) {
-        logs = [
-          { turn: duel.turn, text: `Duelo iniciado: ${duel.player1_username} vs ${duel.player2_username || 'Oponente'}` }
-        ];
+        logs = [...duel.events]
+          .sort((left, right) => right.created_at.localeCompare(left.created_at))
+          .map((event) => formatDuelEvent(event, duel));
+        if (logs.length === 0) {
+          logs = [{ turn: duel.turn, text: `Duelo iniciado: ${duel.player1_username} vs ${duel.player2_username || 'Oponente'}` }];
+        }
       }
     } catch (e) {
       error = e instanceof Error ? e.message : 'Error al cargar el duelo.';
+    }
+  }
+
+  async function loadSpectators() {
+    const response = await apiFetch(`/api/duels/${duelId}/spectators`);
+    if (response.ok) spectators = await response.json();
+  }
+
+  async function loadBoardCards() {
+    const response = await apiFetch(`/api/duels/${duelId}/cards`);
+    if (response.ok) boardCards = await response.json();
+  }
+
+  async function loadDeckChoices() {
+    if (!duel || !player) return;
+    const deckId = duel.player1_id === player.id ? duel.player1_deck_id : duel.player2_deck_id;
+    if (!deckId) return;
+    const response = await apiFetch(`/api/decks/${deckId}`);
+    if (response.ok) deckChoices = (await response.json()).card_entries;
+  }
+
+  function zoneLabel(zone: string | null) {
+    return duelZones.find((item) => item.value === zone)?.label || zone || 'desconocida';
+  }
+
+  async function registerBoardCard(event: SubmitEvent) {
+    event.preventDefault();
+    boardMessage = '';
+    boardError = '';
+    const [kind, rawId] = selectedCard.split(':');
+    const position = selectedPosition === '' ? null : Number(selectedPosition) - 1;
+    let response: Response;
+
+    if (kind === 'instance') {
+      response = await apiFetch(`/api/duels/${duelId}/cards/${rawId}`, {
+        method: 'PUT',
+        body: JSON.stringify({ zone: selectedZone, position, face_down: selectedFaceDown, source_device: 'web' })
+      });
+    } else {
+      const deckCard = deckChoices.find((item) => item.card_id === Number(rawId));
+      if (!deckCard) return;
+      const sourceZone = { main: 'main_deck', extra: 'extra_deck', side: 'side_deck' }[deckCard.section];
+      response = await apiFetch(`/api/duels/${duelId}/cards`, {
+        method: 'POST',
+        body: JSON.stringify({
+          card_id: deckCard.card_id,
+          source_zone: sourceZone,
+          zone: selectedZone,
+          position,
+          face_down: selectedFaceDown,
+          preferred_print_id: deckCard.preferred_print_id,
+          source_device: 'web'
+        })
+      });
+    }
+
+    const result = await response.json();
+    if (!response.ok) {
+      boardError = result.detail || 'No se pudo guardar el movimiento.';
+      return;
+    }
+    boardMessage = 'Movimiento guardado.';
+    selectedCard = '';
+    selectedPosition = '';
+    selectedFaceDown = false;
+    await loadBoardCards();
+  }
+
+  async function inviteSpectator(event: SubmitEvent) {
+    event.preventDefault();
+    spectatorMessage = '';
+    spectatorError = '';
+    const response = await apiFetch(`/api/duels/${duelId}/spectators`, {
+      method: 'POST',
+      body: JSON.stringify({ username: spectatorUsername.trim() })
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      spectatorError = result.detail || 'No se pudo invitar a esa cuenta.';
+      return;
+    }
+    spectators = [...spectators, result];
+    spectatorUsername = '';
+    spectatorMessage = `Invitación enviada a ${result.username}.`;
+  }
+
+  async function revokeSpectator(spectator: DuelSpectator) {
+    const response = await apiFetch(`/api/duels/${duelId}/spectators/${spectator.player_id}`, {
+      method: 'DELETE'
+    });
+    if (!response.ok) {
+      spectatorError = 'No se pudo revocar el acceso.';
+      return;
+    }
+    spectators = spectators.filter((item) => item.player_id !== spectator.player_id);
+    spectatorMessage = `Acceso de ${spectator.username} revocado.`;
+  }
+
+  async function createCameraPairing() {
+    cameraPairingError = '';
+    try {
+      const response = await apiFetch(`/api/duels/${duelId}/camera-pairings`, { method: 'POST' });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'No se pudo crear el QR.');
+      cameraPairingUrl = new URL(`/scanner?pairing_token=${encodeURIComponent(result.pairing_token)}`, window.location.origin).toString();
+      cameraPairingExpiry = new Date(result.expires_at).toLocaleTimeString();
+      cameraPairingQr = await QRCode.toDataURL(cameraPairingUrl, {
+        errorCorrectionLevel: 'H',
+        margin: 2,
+        width: 320
+      });
+    } catch (cause) {
+      cameraPairingError = cause instanceof Error ? cause.message : 'No se pudo crear el QR.';
     }
   }
 
@@ -290,9 +512,13 @@
       <div class="turn">
         <small>TURNO {turn}</small>
         <strong>{currentPhase}</strong>
-        <button class="phase-btn" on:click={advancePhase} title="Avanzar a la siguiente fase">
-          Avanzar fase ↷
-        </button>
+        {#if isPlayer}
+          <button class="phase-btn" on:click={advancePhase} title="Avanzar a la siguiente fase">
+            Avanzar fase ↷
+          </button>
+        {:else}
+          <small class="spectator-banner">VISTA DE ESPECTADOR · SOLO LECTURA</small>
+        {/if}
         <div class="connection-status" class:online={connectionStatus === 'connected'} aria-live="polite">
           <span aria-hidden="true"></span>
           {connectionStatus === 'connected' ? 'En vivo' : connectionStatus === 'connecting' ? 'Conectando' : 'Reconectando'}
@@ -304,17 +530,19 @@
     <section class="scoreboard">
       <!-- JUGADOR ACTUAL -->
       <div class="fighter me">
-        <small>TU LP</small>
-        <strong>{myLp}</strong>
-        <span>{myUsername}</span>
-        <div class="lp-actions">
-          <button on:click={() => changeLp(-1000, 'me')}>−1000</button>
-          <button on:click={() => changeLp(-500, 'me')}>−500</button>
-          <button on:click={() => changeLp(-100, 'me')}>−100</button>
-          <button on:click={() => changeLp(100, 'me')}>+100</button>
-          <button on:click={() => changeLp(500, 'me')}>+500</button>
-          <button on:click={() => changeLp(1000, 'me')}>+1000</button>
-        </div>
+        <small>{isPlayer ? 'TU LP' : duel.player1_username}</small>
+        <strong>{firstPlayerLp}</strong>
+        <span>{isPlayer ? myUsername : duel.player1_username}</span>
+        {#if isPlayer}
+          <div class="lp-actions">
+            <button on:click={() => changeLp(-1000, 'me')}>−1000</button>
+            <button on:click={() => changeLp(-500, 'me')}>−500</button>
+            <button on:click={() => changeLp(-100, 'me')}>−100</button>
+            <button on:click={() => changeLp(100, 'me')}>+100</button>
+            <button on:click={() => changeLp(500, 'me')}>+500</button>
+            <button on:click={() => changeLp(1000, 'me')}>+1000</button>
+          </div>
+        {/if}
       </div>
 
       <div class="versus">
@@ -324,17 +552,19 @@
 
       <!-- OPONENTE -->
       <div class="fighter opponent">
-        <small>OPONENTE</small>
-        <strong>{opponentLp}</strong>
-        <span>{opponentUsername}</span>
-        <div class="lp-actions">
-          <button on:click={() => changeLp(-1000, 'opponent')}>−1000</button>
-          <button on:click={() => changeLp(-500, 'opponent')}>−500</button>
-          <button on:click={() => changeLp(-100, 'opponent')}>−100</button>
-          <button on:click={() => changeLp(100, 'opponent')}>+100</button>
-          <button on:click={() => changeLp(500, 'opponent')}>+500</button>
-          <button on:click={() => changeLp(1000, 'opponent')}>+1000</button>
-        </div>
+        <small>{isPlayer ? 'OPONENTE' : duel.player2_username || 'Oponente'}</small>
+        <strong>{secondPlayerLp}</strong>
+        <span>{isPlayer ? opponentUsername : duel.player2_username || 'Oponente'}</span>
+        {#if isPlayer}
+          <div class="lp-actions">
+            <button on:click={() => changeLp(-1000, 'opponent')}>−1000</button>
+            <button on:click={() => changeLp(-500, 'opponent')}>−500</button>
+            <button on:click={() => changeLp(-100, 'opponent')}>−100</button>
+            <button on:click={() => changeLp(100, 'opponent')}>+100</button>
+            <button on:click={() => changeLp(500, 'opponent')}>+500</button>
+            <button on:click={() => changeLp(1000, 'opponent')}>+1000</button>
+          </div>
+        {/if}
       </div>
     </section>
 
@@ -422,9 +652,11 @@
         <!-- Barra inferior: Destierro, Escáner y Mano -->
         <div class="bottom-tools">
           <div class="zone banish-zone"><span>DESTIERRO (0)</span></div>
-          <button class="scan-button" on:click={() => alert('Escáner móvil se activará con código QR')}>
-            📷 Vincular Escáner
-          </button>
+          {#if isPlayer}
+            <button class="scan-button" on:click={createCameraPairing}>
+              📷 Vincular Escáner
+            </button>
+          {/if}
           <div class="hand">
             <span>MANO ({myUsername})</span>
             <i></i><i></i><i></i><i></i><i></i>
@@ -433,6 +665,26 @@
 
         <small class="field-label">TU CAMPO ({myUsername})</small>
       </div>
+    </section>
+
+    <section class="board-card-ledger" aria-label="Cartas registradas en zonas">
+      <header>
+        <div><small class="eyebrow">Estado del tablero</small><h2>Cartas en zonas</h2></div>
+        <span>{boardCards.length} registradas</span>
+      </header>
+      {#if boardCards.length > 0}
+        <div class="board-card-list">
+          {#each boardCards as boardCard (boardCard.id)}
+            <article>
+              <strong>{boardCard.hidden ? 'Carta oculta' : boardCard.card_name}</strong>
+              <span>{boardCard.player_username} · {zoneLabel(boardCard.zone)}{boardCard.position !== null ? ` ${boardCard.position + 1}` : ''}</span>
+              {#if boardCard.face_down}<small>Boca abajo</small>{/if}
+            </article>
+          {/each}
+        </div>
+      {:else}
+        <p class="board-empty">Todavía no hay cartas registradas fuera de los decks.</p>
+      {/if}
     </section>
 
     <!-- PANEL DE ACCIONES Y REGISTRO EN VIVO -->
@@ -449,8 +701,66 @@
           <p>Mesa lista. Registra cambios de LP o fases.</p>
         {/if}
       </div>
-      <button class="primary" on:click={endTurn}>Fin de turno <span>→</span></button>
-      <button class="secondary" on:click={concedeDuel}>Conceder duelo</button>
+      {#if isPlayer}
+        <button class="primary" on:click={endTurn}>Fin de turno <span>→</span></button>
+        <button class="secondary" on:click={concedeDuel}>Conceder duelo</button>
+        {#if !finished}
+          {#if deckChoices.length > 0}
+            <section class="board-tools">
+              <small class="eyebrow">Registrar carta o movimiento</small>
+              <form on:submit={registerBoardCard}>
+                <label for="board-card">Carta</label>
+                <select id="board-card" bind:value={selectedCard} required>
+                  <option value="">Selecciona una carta</option>
+                  {#each deckChoices as deckCard (`deck-${deckCard.card_id}`)}
+                    <option value={`deck:${deckCard.card_id}`}>{deckCard.card.name} · {deckCard.section}</option>
+                  {/each}
+                  {#each boardCards.filter((card) => card.player_id === player?.id) as boardCard (`instance-${boardCard.id}`)}
+                    <option value={`instance:${boardCard.id}`}>{boardCard.hidden ? 'Carta oculta' : boardCard.card_name} · {zoneLabel(boardCard.zone)}</option>
+                  {/each}
+                </select>
+                <label for="board-zone">Zona destino</label>
+                <select id="board-zone" bind:value={selectedZone}>
+                  {#each duelZones as zone (zone.value)}
+                    <option value={zone.value}>{zone.label}</option>
+                  {/each}
+                </select>
+                <label for="board-position">Slot {zoneNeedsPosition ? '(requerido)' : '(opcional)'}</label>
+                <select id="board-position" bind:value={selectedPosition} required={zoneNeedsPosition}>
+                  {#if !zoneNeedsPosition}<option value="">Automático</option>{/if}
+                  {#each Array.from({ length: slotsForZone(selectedZone) || 5 }, (_, i) => i + 1) as slot (slot)}
+                    <option value={String(slot)}>{slot}</option>
+                  {/each}
+                </select>
+                <label class="face-down-toggle"><input type="checkbox" bind:checked={selectedFaceDown} /> Boca abajo</label>
+                {#if boardError}<p class="board-feedback error" role="alert">{boardError}</p>{/if}
+                {#if boardMessage}<p class="board-feedback" role="status">{boardMessage}</p>{/if}
+                <button class="primary" type="submit">Guardar movimiento</button>
+              </form>
+            </section>
+          {/if}
+          <section class="spectator-tools">
+            <small class="eyebrow">Espectadores invitados</small>
+            <form on:submit={inviteSpectator}>
+              <label for="spectator-username">Cuenta</label>
+              <div class="spectator-invite-row">
+                <input id="spectator-username" bind:value={spectatorUsername} minlength="3" maxlength="50" required placeholder="Nombre de usuario" />
+                <button type="submit" title="Invitar espectador" aria-label="Invitar espectador">＋</button>
+              </div>
+            </form>
+            {#if spectatorError}<p class="spectator-feedback error" role="alert">{spectatorError}</p>{/if}
+            {#if spectatorMessage}<p class="spectator-feedback" role="status">{spectatorMessage}</p>{/if}
+            <ul>
+              {#each spectators as spectator (spectator.player_id)}
+                <li>
+                  <span>{spectator.username}</span>
+                  <button type="button" on:click={() => revokeSpectator(spectator)} title="Revocar acceso a {spectator.username}" aria-label="Revocar acceso a {spectator.username}">×</button>
+                </li>
+              {/each}
+            </ul>
+          </section>
+        {/if}
+      {/if}
     </aside>
 
     {#if finished}
@@ -462,6 +772,22 @@
           <a href="/">Volver al inicio →</a>
         </div>
       </div>
+    {/if}
+    {#if cameraPairingQr}
+      <div class="camera-pairing-backdrop" role="presentation" on:click={() => (cameraPairingQr = '')}>
+        <div class="camera-pairing-dialog" role="dialog" aria-modal="true" aria-labelledby="camera-pairing-title" tabindex="-1" on:click|stopPropagation>
+          <button class="camera-pairing-close" type="button" on:click={() => (cameraPairingQr = '')} aria-label="Cerrar QR">×</button>
+          <small class="eyebrow">Cámara compañera</small>
+          <h2 id="camera-pairing-title">Vincula este teléfono</h2>
+          <img src={cameraPairingQr} alt="QR temporal para vincular la cámara a este duelo" />
+          <p>Abre el escáner del teléfono y apunta a este código.</p>
+          <small>El QR vence a las {cameraPairingExpiry} y solo puede usarse una vez.</small>
+          <a href={cameraPairingUrl}>Abrir escáner en este dispositivo</a>
+        </div>
+      </div>
+    {/if}
+    {#if cameraPairingError}
+      <div class="camera-pairing-error" role="alert">{cameraPairingError}<button type="button" on:click={() => (cameraPairingError = '')} aria-label="Cerrar">×</button></div>
     {/if}
   </div>
 {/if}
@@ -544,6 +870,10 @@
     background: currentColor;
   }
   .connection-status.online { color: #58c772; }
+  .spectator-banner {
+    margin-top: 8px;
+    color: #d9a441 !important;
+  }
   .exit {
     color: #91a092;
     font: 11px 'DM Mono', monospace;
@@ -617,6 +947,20 @@
     border-radius: 8px;
     box-shadow: 0 16px 40px rgba(0,0,0,0.5);
   }
+  .board-card-ledger {
+    max-width: 960px;
+    margin: 12px auto 0;
+    padding: 10px 0 16px;
+    border-bottom: 1px solid #334137;
+  }
+  .board-card-ledger header { display: flex; align-items: end; justify-content: space-between; gap: 12px; }
+  .board-card-ledger h2 { margin: 4px 0 0; font: 15px 'DM Mono', monospace; }
+  .board-card-ledger header > span, .board-empty { color: #91a092; font: 10px 'DM Mono', monospace; }
+  .board-card-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 1px 16px; margin-top: 10px; }
+  .board-card-list article { display: flex; flex-direction: column; gap: 3px; border-top: 1px solid #26352a; padding: 8px 0; }
+  .board-card-list strong { color: #e8eee5; font-size: 12px; }
+  .board-card-list span, .board-card-list small { color: #91a092; font: 10px 'DM Mono', monospace; }
+  .board-empty { margin: 10px 0 0; }
   .field-side {
     display: flex;
     flex-direction: column;
@@ -637,9 +981,10 @@
   }
   .empty-cell {
     visibility: hidden;
+    aspect-ratio: 5.87 / 8.57;
   }
   .zone {
-    min-height: 68px;
+    aspect-ratio: 5.87 / 8.57;
     border-radius: 4px;
     display: flex;
     flex-direction: column;
@@ -790,6 +1135,8 @@
     box-shadow: 0 10px 35px rgba(0,0,0,0.5);
     border-radius: 4px;
     z-index: 100;
+    max-height: calc(100vh - 50px);
+    overflow-y: auto;
   }
   .actions-panel h2 { margin: 4px 0 12px; font-size: 22px; }
   .action-log {
@@ -806,6 +1153,85 @@
   .primary:hover { background: #c2462c; }
   .secondary { margin-top: 6px; background: transparent; color: #68766a; border: 1px solid #ccd5c8 !important; }
   .secondary:hover { background: #e5ede2; }
+  .spectator-tools {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid #d5ddd2;
+  }
+  .spectator-tools form { margin-top: 8px; }
+  .spectator-tools label { display: block; margin-bottom: 5px; font: 10px 'DM Mono', monospace; }
+  .spectator-invite-row { display: flex; gap: 6px; }
+  .spectator-invite-row input {
+    min-width: 0;
+    flex: 1;
+    border: 1px solid #ccd5c8;
+    padding: 8px;
+    font: 11px 'DM Mono', monospace;
+  }
+  .spectator-invite-row button { width: 40px !important; background: #17211b; color: white; }
+  .spectator-tools ul { list-style: none; margin: 8px 0 0; padding: 0; }
+  .spectator-tools li { display: flex; align-items: center; justify-content: space-between; border-top: 1px solid #d5ddd2; padding: 5px 0; font: 11px 'DM Mono', monospace; }
+  .spectator-tools li button { width: 30px !important; padding: 5px; background: transparent; color: #d9573b; }
+  .spectator-feedback { margin: 7px 0 0; color: #387b45; font-size: 11px; }
+  .spectator-feedback.error { color: #b33e2a; }
+  .camera-pairing-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1200;
+    display: grid;
+    place-items: center;
+    padding: 20px;
+    background: rgba(7, 12, 8, .78);
+  }
+  .camera-pairing-dialog {
+    position: relative;
+    width: min(390px, 100%);
+    display: grid;
+    justify-items: center;
+    gap: 10px;
+    padding: 30px;
+    background: #f4f1e8;
+    color: #17211b;
+    text-align: center;
+    box-shadow: 0 20px 60px rgba(0,0,0,.4);
+  }
+  .camera-pairing-dialog h2 { margin: 0; font-size: 25px; }
+  .camera-pairing-dialog img { width: 250px; height: 250px; image-rendering: pixelated; }
+  .camera-pairing-dialog p { margin: 0; font-size: 13px; }
+  .camera-pairing-dialog small { color: #68766a; font: 10px 'DM Mono', monospace; }
+  .camera-pairing-dialog a { color: #d9573b; font: 11px 'DM Mono', monospace; }
+  .camera-pairing-close {
+    position: absolute;
+    right: 8px;
+    top: 8px;
+    width: 32px;
+    height: 32px;
+    border: 0;
+    background: transparent;
+    color: #17211b;
+    font-size: 22px;
+    cursor: pointer;
+  }
+  .camera-pairing-error {
+    position: fixed;
+    z-index: 1300;
+    right: 20px;
+    top: 20px;
+    max-width: calc(100% - 40px);
+    padding: 12px 40px 12px 14px;
+    background: #f4f1e8;
+    color: #a93625;
+    font-size: 12px;
+  }
+  .camera-pairing-error button { position: absolute; right: 8px; top: 5px; border: 0; background: transparent; font-size: 18px; }
+  .board-tools { margin-top: 14px; padding-top: 12px; border-top: 1px solid #d5ddd2; }
+  .board-tools form { display: grid; gap: 6px; margin-top: 8px; }
+  .board-tools label { font: 10px 'DM Mono', monospace; }
+  .board-tools select, .board-tools input:not([type='checkbox']) { width: 100%; min-width: 0; box-sizing: border-box; border: 1px solid #ccd5c8; padding: 8px; background: #fff; color: #17211b; font: 11px 'DM Mono', monospace; }
+  .board-tools .face-down-toggle { display: flex; align-items: center; gap: 6px; }
+  .board-tools .face-down-toggle input { margin: 0; }
+  .board-feedback { margin: 4px 0; color: #387b45; font-size: 11px; }
+  .board-feedback.error { color: #b33e2a; }
   .eyebrow { color: #d9573b; font: 10px 'DM Mono', monospace; text-transform: uppercase; letter-spacing: .08em; }
 
   .overlay {
