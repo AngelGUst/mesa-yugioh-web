@@ -35,6 +35,7 @@
     id: number;
     card_id: number | null;
     card_name: string;
+    image_url: string | null;
     player_id: number;
     player_username: string;
     zone: string;
@@ -601,17 +602,32 @@
 
     <!-- TABLERO DIGITAL DE YU-GI-OH! (REGLA MAESTRA / 7 COLUMNAS) -->
     {#snippet zoneCell(cls, label, zone, position, ownerId, anyOwner = false, badge = '')}
-      <div class="zone {cls}" class:occupied={position !== null && !!cardAt(zone, position, ownerId, anyOwner)}>
-        {#if badge}<span class="emz-badge">{badge}</span>{/if}
-        {#if position !== null && cardAt(zone, position, ownerId, anyOwner)}
-          <strong class="zone-card-name">{displayCardName(cardAt(zone, position, ownerId, anyOwner))}</strong>
-          <span class="zone-card-sub">{cardAt(zone, position, ownerId, anyOwner).player_username}</span>
-        {:else if position === null && countAt(zone, ownerId) > 0}
-          <span>{label} ({countAt(zone, ownerId)})</span>
-        {:else}
-          <span>{label}</span>
-        {/if}
-      </div>
+      {#if position !== null}
+        {@const card = cardAt(zone, position, ownerId, anyOwner)}
+        <div class="zone {cls}" class:occupied={!!card}>
+          {#if badge}<span class="emz-badge">{badge}</span>{/if}
+          {#if card}
+            {#if !card.face_down && card.image_url}
+              <img class="zone-card-img" src={card.image_url} alt={displayCardName(card)} loading="lazy" />
+              <span class="zone-card-tag">{card.player_username}</span>
+            {:else}
+              <strong class="zone-card-name">{displayCardName(card)}</strong>
+              <span class="zone-card-sub">{card.player_username}</span>
+            {/if}
+          {:else}
+            <span>{label}</span>
+          {/if}
+        </div>
+      {:else}
+        <div class="zone {cls}">
+          {#if badge}<span class="emz-badge">{badge}</span>{/if}
+          {#if countAt(zone, ownerId) > 0}
+            <span>{label} ({countAt(zone, ownerId)})</span>
+          {:else}
+            <span>{label}</span>
+          {/if}
+        </div>
+      {/if}
     {/snippet}
     <section class="board">
       {#key boardCards}
@@ -1036,6 +1052,8 @@
     transition: all 0.15s ease;
     user-select: none;
     box-sizing: border-box;
+    position: relative;
+    overflow: hidden;
   }
   .zone-card-name {
     font-size: 8px;
@@ -1049,6 +1067,27 @@
   }
   .zone-card-sub { font-size: 7px; opacity: 0.85; margin-top: 2px; }
   .zone.occupied { border-style: solid; filter: brightness(1.3); }
+  .zone-card-img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 2px;
+  }
+  .zone-card-tag {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: rgba(0, 0, 0, 0.68);
+    color: #fff;
+    font-size: 7px;
+    padding: 1px 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   /* Campo */
   .field-spell-zone {
     border: 2px solid #2e7d32;
