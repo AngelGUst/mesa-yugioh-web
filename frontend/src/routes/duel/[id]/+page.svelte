@@ -614,6 +614,7 @@
       </div>
     {/snippet}
     <section class="board">
+      {#key boardCards}
       <!-- CAMPO OPONENTE -->
       <div class="field-side opponent-field">
         <small class="field-label">CAMPO DEL OPONENTE ({opponentUsername})</small>
@@ -697,6 +698,7 @@
 
         <small class="field-label">TU CAMPO ({myUsername})</small>
       </div>
+      {/key}
     </section>
 
     <section class="board-card-ledger" aria-label="Cartas registradas en zonas">
