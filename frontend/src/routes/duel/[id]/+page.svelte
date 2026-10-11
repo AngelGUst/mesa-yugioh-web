@@ -97,6 +97,7 @@
   let cameraPairingUrl = '';
   let cameraPairingExpiry = '';
   let cameraPairingError = '';
+  let actionsOpen = false;
 
   const duelZones = [
     { value: 'main_deck', label: 'Deck principal' },
@@ -688,7 +689,12 @@
     </section>
 
     <!-- PANEL DE ACCIONES Y REGISTRO EN VIVO -->
-    <aside class="actions-panel">
+    <aside class="actions-panel" class:collapsed={!actionsOpen}>
+      <button type="button" class="actions-toggle" on:click={() => (actionsOpen = !actionsOpen)} aria-expanded={actionsOpen} aria-label="Mostrar u ocultar el registro de mesa">
+        <span class="toggle-title"><small class="eyebrow">Registro de Mesa</small>{#if !actionsOpen}<span class="toggle-count">{logs.length} eventos</span>{/if}</span>
+        <span class="toggle-chevron" aria-hidden="true">{actionsOpen ? '▾' : '▸'}</span>
+      </button>
+      {#if actionsOpen}
       <div>
         <small class="eyebrow">Registro de Mesa</small>
         <h2>Acciones</h2>
@@ -760,6 +766,7 @@
             </ul>
           </section>
         {/if}
+      {/if}
       {/if}
     </aside>
 
@@ -1139,6 +1146,11 @@
     overflow-y: auto;
   }
   .actions-panel h2 { margin: 4px 0 12px; font-size: 22px; }
+  .actions-panel.collapsed { width: auto; min-width: 200px; padding: 10px 14px; }
+  .actions-toggle { display: flex !important; align-items: center; justify-content: space-between; gap: 12px; width: 100% !important; background: transparent !important; border: 0 !important; padding: 4px 0 !important; cursor: pointer; }
+  .actions-toggle .toggle-title { display: flex; align-items: baseline; gap: 10px; }
+  .actions-toggle .toggle-count { font-size: 11px; color: #68766a; }
+  .actions-toggle .toggle-chevron { font-size: 14px; color: #17211b; }
   .action-log {
     border-top: 1px solid #d5ddd2;
     border-bottom: 1px solid #d5ddd2;
