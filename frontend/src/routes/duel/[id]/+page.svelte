@@ -98,6 +98,7 @@
   let cameraPairingExpiry = '';
   let cameraPairingError = '';
   let actionsOpen = false;
+  let appVersion = '';
 
   const duelZones = [
     { value: 'main_deck', label: 'Deck principal' },
@@ -211,6 +212,10 @@
       isLoading = false;
       if (!error) {
         await loadBoardCards();
+        try {
+          const versionResponse = await fetch('/_app/version.json');
+          if (versionResponse.ok) appVersion = String((await versionResponse.json()).version || '').slice(0, 8);
+        } catch {}
         if (isPlayer) await Promise.all([loadSpectators(), loadDeckChoices()]);
         connect();
       }
@@ -573,6 +578,7 @@
       <div class="versus">
         VS<br />
         <small>SALA {duel.duel_code}</small>
+        {#if appVersion}<small class="build-tag">build {appVersion}</small>{/if}
       </div>
 
       <!-- OPONENTE -->
