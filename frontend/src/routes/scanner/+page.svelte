@@ -79,6 +79,14 @@
   let selectedPosition = 1;
   let faceDown = false;
   let useCurrentCanvas = false;
+  let autoCapture = true;
+  let stableFrames = 0;
+  let previousCenters: Map<number, Point> | null = null;
+  let lastAutoCaptureAt = 0;
+  let lastAutoCellKey = '';
+  const AUTO_STABLE_FRAMES = 4;
+  const AUTO_MOVE_TOLERANCE_PX = 6;
+  const AUTO_COOLDOWN_MS = 4000;
 
   $: selectedZoneDefinition = zones.find((zone) => zone.value === selectedZone) || zones[0];
   $: availablePositions = availablePositionsForZone(selectedZone);
@@ -241,6 +249,7 @@
             ? 'Se ven los 4 marcadores, pero su geometría no permite calibrar.'
             : `Marcadores detectados: ${markerCount}/4`;
         drawOverlay(overlayContext, width, height, detections, calibration);
+        maybeAutoCapture(points, width, height);
       } catch (error) {
         cameraError = error instanceof Error ? error.message : 'Falló la detección de marcadores.';
         calibration = null;
@@ -405,6 +414,44 @@
     }
     context.fillStyle = '#fff';
     context.fillText('TAPETE CALIBRADO', 12, 22);
+  }
+
+  function maybeAutoCapture(points: Map<number, Point>, width: number, height: number) {
+    if (!autoCapture || !calibration || isCapturing || isRecognizing || capturedImage) {
+      if (!calibration) { stableFrames = 0; previousCenters = null; }
+      return;
+    }
+    let maxMove = Number.POSITIVE_INFINITY;
+    if (previousCenters && previousCenters.size === points.size) {
+      maxMove = 0;
+      for (const [id, point] of points) {
+        const previous = previousCenters.get(id);
+        if (!previous) { maxMove = Number.POSITIVE_INFINITY; break; }
+        maxMove = Math.max(maxMove, Math.hypot(point.x - previous.x, point.y - previous.y));
+      }
+    }
+    previousCenters = new Map(points);
+    stableFrames = maxMove <= AUTO_MOVE_TOLERANCE_PX ? stableFrames + 1 : 0;
+    if (stableFrames < AUTO_STABLE_FRAMES) return;
+    if (Date.now() - lastAutoCaptureAt < AUTO_COOLDOWN_MS) return;
+    const detected = detectCellAtCenter(calibration, width, height)?.cell ?? null;
+    if (!detected) return;
+    const cellKey = `${detected.zone}:${detected.position}`;
+    if (cellKey === lastAutoCellKey) return;
+    if (slotsForZone(detected.zone) > 0 && availablePositionsForZone(detected.zone).length === 0) return;
+    lastAutoCellKey = cellKey;
+    lastAutoCaptureAt = Date.now();
+    stableFrames = 0;
+    void captureCard();
+  }
+
+  function discardCapture() {
+    capturedImage = '';
+    captureCanvas = null;
+    capturedCalibration = null;
+    captureId = '';
+    lastAutoCellKey = '';
+    lastAutoCaptureAt = Date.now();
   }
 
   async function captureCard() {
@@ -610,6 +657,9 @@
             <button type="button" class="primary" on:click={startCamera} disabled={isCameraStarting}>{isCameraStarting ? 'Abriendo cámara…' : 'Abrir cámara trasera'}</button>
           {:else}
             <button type="button" class="secondary" on:click={stopCamera}>Detener cámara</button>
+            <button type="button" class="secondary" on:click={() => (autoCapture = !autoCapture)} aria-pressed={autoCapture} title="Dispara la captura solo cuando el teléfono está quieto sobre una celda">
+              Auto: {autoCapture ? 'ON' : 'OFF'}
+            </button>
             <button type="button" class="primary" on:click={captureCard} disabled={!isCalibrated || isCapturing || isRecognizing}>
               {isCapturing ? 'Capturando…' : isRecognizing ? 'Leyendo carta…' : 'Capturar carta'}
             </button>
@@ -649,9 +699,9 @@
           <button type="button" class="primary confirm-button" on:click={confirmCardAction} disabled={!capturedCalibration || !selectedCardId || isSubmitting || (selectedZoneDefinition.slots > 0 && availablePositions.length === 0)}>
             {isSubmitting ? 'Guardando…' : 'Confirmar y registrar'}
           </button>
-          <button type="button" class="text-button" on:click={() => { capturedImage = ''; captureCanvas = null; capturedCalibration = null; captureId = ''; }}>Descartar captura</button>
+          <button type="button" class="text-button" on:click={discardCapture}>Descartar captura</button>
         {:else}
-          <p>Cuando los cuatro marcadores estén visibles, captura la carta. La lectura solo propone una coincidencia; no modifica la partida hasta que confirmes.</p>
+          <p>{autoCapture ? 'Mantén el teléfono quieto con la cruz sobre la carta y la captura se dispara sola.' : 'Cuando los cuatro marcadores estén visibles, captura la carta.'} La lectura solo propone una coincidencia; no modifica la partida hasta que confirmes.</p>
         {/if}
         {#if captureMessage}<p class="success-message" role="status">{captureMessage}</p>{/if}
       </section>
