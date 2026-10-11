@@ -80,6 +80,11 @@
   let faceDown = false;
   let useCurrentCanvas = false;
   let autoCapture = true;
+  let appVersion = '';
+  $: boardCardCount = boardCards.length;
+  $: monsterTaken = boardCards
+    .filter((card) => card.zone === 'monster_zone' && card.player_id === session?.player_id)
+    .map((card) => card.position);
   let stableFrames = 0;
   let previousCenters: Map<number, Point> | null = null;
   let lastAutoCaptureAt = 0;
@@ -115,6 +120,10 @@
 
         if (disposed) return;
         boardCards = await loadCameraBoardCards();
+        try {
+          const versionResponse = await fetch('/_app/version.json');
+          if (versionResponse.ok) appVersion = String((await versionResponse.json()).version || '').slice(0, 8);
+        } catch {}
         selectedPosition = availablePositionsForZone(selectedZone)[0] || 0;
         await loadAprilTagDetector();
         if (disposed) return;
@@ -692,6 +701,7 @@
         <canvas bind:this={processCanvas} class="hidden-canvas" aria-hidden="true"></canvas>
         <div class="calibration-status" class:ready={isCalibrated} aria-live="polite">
           <span class="status-dot"></span>{cameraStatus}
+          {#if appVersion}<span class="build-tag">build {appVersion}</span>{/if}
         </div>
         {#if missingMarkerNames.length > 0 && stream}
           <p class="marker-hint">Faltan: {missingMarkerNames.join(', ')}. IDs esperados: 0, 1, 2 y 4 (tagStandard41h12).</p>
@@ -747,6 +757,7 @@
           <button type="button" class="text-button" on:click={discardCapture}>Descartar captura</button>
         {:else}
           <p>{autoCapture ? 'Mantén el teléfono quieto con la cruz sobre la carta y la captura se dispara sola.' : 'Cuando los cuatro marcadores estén visibles, captura la carta.'} La lectura solo propone una coincidencia; no modifica la partida hasta que confirmes.</p>
+          <p class="board-debug">Tablero: {boardCardCount} carta(s) · monstruos ocupados: {monsterTaken.length ? monsterTaken.join(', ') : 'ninguno'}{#if ocrText} · texto leído: {ocrText.length} caracteres{/if}</p>
         {/if}
         {#if captureMessage}<p class="success-message" role="status">{captureMessage}</p>{/if}
       </section>
