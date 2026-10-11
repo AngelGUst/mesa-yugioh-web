@@ -87,6 +87,7 @@
   const AUTO_STABLE_FRAMES = 4;
   const AUTO_MOVE_TOLERANCE_PX = 6;
   const AUTO_COOLDOWN_MS = 4000;
+  const AUTO_CONFIRM_MAX_SCORE = 0.15;
 
   $: selectedZoneDefinition = zones.find((zone) => zone.value === selectedZone) || zones[0];
   $: availablePositions = availablePositionsForZone(selectedZone);
@@ -462,7 +463,10 @@
       return;
     }
     capturedCalibration = [...calibration];
-    const detectedCell = detectCellAtCenter(calibration, overlayCanvas?.width || 640, overlayCanvas?.height || 480)?.cell ?? null;
+    const procWidth = overlayCanvas?.width || 640;
+    const procHeight = overlayCanvas?.height || 480;
+    const detection = detectCellAtCenter(calibration, procWidth, procHeight);
+    const detectedCell = detection?.cell ?? null;
     try { boardCards = await loadCameraBoardCards(); } catch {}
     if (detectedCell) {
       const free = availablePositionsForZone(detectedCell.zone);
@@ -486,10 +490,15 @@
     isRecognizing = true;
     try {
       if (!ocrWorker) ocrWorker = await createWorker('eng');
-      const result = await ocrWorker.recognize(canvas);
+      const ocrSource = detection ? cropCellCanvas(canvas, capturedCalibration, detection.row, detection.column, procWidth, procHeight) ?? canvas : canvas;
+      const result = await ocrWorker.recognize(ocrSource);
       ocrText = result.data.text.trim();
       suggestions = rankDeckCandidates(ocrText, session?.deck_cards || []);
       if (suggestions.length) selectedCardId = String(suggestions[0].card.card_id);
+      if (autoCapture && suggestions.length && suggestions[0].score <= AUTO_CONFIRM_MAX_SCORE && selectedCardId) {
+        await confirmCardAction();
+        return;
+      }
       captureMessage = suggestions.length ? 'Revisa la sugerencia y confirma o corrige la carta.' : 'No hubo coincidencia clara. Elige la carta manualmente del deck.';
       await tick();
       capturePanelElement?.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -499,6 +508,41 @@
       isCapturing = false;
       isRecognizing = false;
     }
+  }
+
+  function cropCellCanvas(
+    full: HTMLCanvasElement,
+    matrix: number[],
+    row: number,
+    column: number,
+    procWidth: number,
+    procHeight: number
+  ): HTMLCanvasElement | null {
+    const scaleX = full.width / procWidth;
+    const scaleY = full.height / procHeight;
+    const corners = [
+      [column / MAT_COLUMNS, row / MAT_ROWS],
+      [(column + 1) / MAT_COLUMNS, row / MAT_ROWS],
+      [(column + 1) / MAT_COLUMNS, (row + 1) / MAT_ROWS],
+      [column / MAT_COLUMNS, (row + 1) / MAT_ROWS]
+    ].map(([u, v]) => projectPoint(matrix, u, v));
+    if (corners.some((point) => point === null)) return null;
+    const xs = corners.map((point) => point!.x * scaleX);
+    const ys = corners.map((point) => point!.y * scaleY);
+    const marginX = (Math.max(...xs) - Math.min(...xs)) * 0.15;
+    const marginY = (Math.max(...ys) - Math.min(...ys)) * 0.15;
+    const sourceX = Math.max(0, Math.floor(Math.min(...xs) - marginX));
+    const sourceY = Math.max(0, Math.floor(Math.min(...ys) - marginY));
+    const sourceWidth = Math.min(full.width - sourceX, Math.ceil(Math.max(...xs) + marginX) - sourceX);
+    const sourceHeight = Math.min(full.height - sourceY, Math.ceil(Math.max(...ys) + marginY) - sourceY);
+    if (sourceWidth < 40 || sourceHeight < 40) return null;
+    const cropped = document.createElement('canvas');
+    cropped.width = sourceWidth * 2;
+    cropped.height = sourceHeight * 2;
+    const croppedContext = cropped.getContext('2d');
+    if (!croppedContext) return null;
+    croppedContext.drawImage(full, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, cropped.width, cropped.height);
+    return cropped;
   }
 
   function normalizeText(value: string): string {
@@ -587,6 +631,7 @@
       boardCards = await loadCameraBoardCards();
       selectedPosition = availablePositionsForZone(selectedZone)[0] || 0;
       captureMessage = `${chosen.name} registrada en ${selectedZoneDefinition.label}.`;
+      lastAutoCellKey = '';
       capturedImage = '';
       captureCanvas = null;
       capturedCalibration = null;
