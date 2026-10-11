@@ -15,6 +15,9 @@ dist/
 .env
 .env.*
 !.env.example
+.certs/
+*.pem
+*.key
 
 # IDE
 .vscode/

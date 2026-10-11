@@ -9,12 +9,13 @@
 | Cuenta, JWT, perfil, decks y salas | Implementado |
 | Catálogo e impresiones físicas | Implementado |
 | Selección de deck por jugador antes del duelo | Implementado en la creación/unión de sala |
-| Persistencia de LP, turno, fase y eventos | Implementado en API |
-| Tablero de una sala persistida | Pendiente |
-| Sincronización entre dos sesiones | Pendiente: no hay WebSockets |
-| Celular vinculado por QR | Pendiente |
-| Cámara, calibración y escaneo puntual | Pendiente |
-| OCR y reconocimiento de cartas | Pendiente |
+| Persistencia de LP, turno, fase, eventos y cartas por zona | Implementada en API |
+| Tablero de una sala persistida | Implementado para LP, turno, fase, resultado y registro/movimiento manual de cartas por zona. |
+| Sincronización entre dos sesiones | Implementada con WebSocket, snapshots al conectar/reconectar y revisiones monotónicas. |
+| Celular vinculado por QR | Implementado con token de un uso (5 min) y sesión acotada al duelo/jugador. |
+| Cámara y calibración | Implementadas en `/scanner` para HTTPS, cámara trasera y AprilTag `tagStandard41h12`; falta validar físicamente en Android/iOS. |
+| OCR y reconocimiento de cartas | Implementados como sugerencia local con Tesseract.js y candidatas del deck; el humano corrige/confirma. |
+| Autorización privada de espectadores por sala | Implementada: invitación a cuenta existente, solo lectura, revocable y válida hasta finalizar el duelo. |
 | Motor completo de reglas, cadenas y efectos | Fuera del MVP inicial |
 
 ## Decisiones de arquitectura
@@ -50,26 +51,31 @@ Registro / login
        -> seleccionar sección e impresión preferida
   -> Crear sala con deck opcional
   -> Segundo jugador se une por código con su deck opcional
-  -> API persiste LP, turno, fase, resultado y eventos
+  -> Abrir tablero persistido; REST carga el snapshot inicial
+  -> Registrar/mover copias del deck en zonas y consultar historial con actor/dispositivo
+  -> WebSocket difunde estado y eventos con revisión monotónica
+  -> Al reconectar, recibir snapshot actual y descartar revisiones antiguas
 ```
+
+El tablero sincroniza LP, turno, fase, estado y copias registradas por zona. El scanner propone cartas desde una captura y registra solo después de la confirmación humana; la detección automática continua de movimientos sigue fuera del MVP.
 
 El constructor de decks deduplica respuestas de catálogo y usa claves de render estables para soportar variantes de impresión sin provocar el error `each_key_duplicate`.
 
-## Flujo objetivo del celular
+## Flujo del celular implementado
 
 ### Vinculación
 
-Desde el tablero de la PC, el jugador pulsará **Vincular cámara**. El backend generará un token temporal, de un solo uso, vinculado al usuario y duelo. La PC mostrará un QR que abrirá:
+Desde el tablero de la PC, el jugador pulsa **Vincular Escáner**. El backend genera un token aleatorio, de un solo uso y válido cinco minutos, vinculado al jugador y duelo. Al canjearlo, el teléfono recibe un token de cámara limitado a colocar/mover cartas de ese jugador; la sesión vence a las 12 horas como máximo y se revoca al terminar el duelo. La PC muestra un QR que abre:
 
 ```text
 /scanner?pairing_token=...
 ```
 
-El backend deberá validar tanto el token como que el propietario del teléfono sea un participante autorizado. Un token QR no sustituye la autorización de sala.
+El backend valida el pairing y el teléfono nunca recibe el JWT completo del jugador. El token de pairing no puede reutilizarse y la acción cámara solo acepta cartas del deck asignado.
 
 ### Calibración del tapete
 
-La cámara deberá reconocer cuatro marcadores ArUco o AprilTags colocados alrededor del tapete:
+La ruta `/scanner` detecta los cuatro AprilTags Standard41h12 impresos en [la hoja A4](marcadores/hoja_marcadores_A4.svg), con IDs `0`, `1`, `2` y `4`, colocados en las esquinas del tapete:
 
 ```text
 [Superior izquierdo]                         [Superior derecho]
@@ -79,21 +85,22 @@ La cámara deberá reconocer cuatro marcadores ArUco o AprilTags colocados alred
 [Inferior izquierdo]                         [Inferior derecho]
 ```
 
-Con los cuatro marcadores se calculará una homografía y se dibujarán las zonas virtuales. Si falta un marcador o la cámara cambia de posición, se pausará el escaneo y se pedirá recalibrar. Se usan marcadores fiduciarios y no post-its de colores porque son más estables ante luz, sombras y reflejos.
+Con los cuatro marcadores se calcula una homografía y se dibuja la superposición de zonas. Si falta un marcador, se pierde la cámara o no puede validarse la calibración, se bloquea la confirmación. Falta probar tamaño/distancia e iluminación en los teléfonos físicos.
 
 ### Escaneo puntual confirmado
 
-La primera versión de cámara no analizará video continuo. El jugador elegirá una intención, encuadrará la carta y confirmará el resultado:
+La primera versión no analiza video continuo. El jugador mantiene los marcadores visibles, captura la carta, revisa la propuesta OCR contra su deck y confirma zona/posición:
 
 ```text
 Elegir acción y zona
   -> capturar carta
-  -> corregir perspectiva
-  -> reconocer código, set y texto
+  -> verificar calibración y corregir perspectiva (captura manual)
+  -> leer texto de la captura con OCR local
   -> buscar primero en el deck activo
   -> mostrar sugerencia y confianza
   -> confirmar, corregir o cancelar
-  -> persistir evento y sincronizar el tablero
+  -> confirmar explícitamente
+  -> registrar carta/evento idempotente y sincronizar el tablero
 ```
 
 Acciones iniciales:
@@ -109,9 +116,9 @@ Acciones iniciales:
 
 Prioridad de identificación:
 
-1. Código de contraseña de ocho dígitos.
-2. Código de set para identificar una impresión concreta.
-3. OCR del nombre normalizado, primero contra el deck activo.
+1. OCR del nombre normalizado de la captura, primero contra el deck activo.
+2. Selección manual de una candidata del deck si el OCR no encuentra coincidencia clara.
+3. Código de contraseña y código de set quedan para una mejora posterior del reconocedor.
 4. ATK, DEF, nivel, tipo y atributo para desambiguar.
 5. Ilustración como señal de respaldo.
 
@@ -129,7 +136,7 @@ No se transmitirá video continuo al servidor. La aplicación enviará una captu
 - Hand.
 - Removed Cards / Banish Pile.
 
-Las primeras versiones usarán estas zonas como guía visual y destinos elegidos manualmente. La detección automática de movimientos queda para después.
+Las zonas son destinos elegidos manualmente desde el panel del tablero. Las posiciones de monstruos, magia/trampa y monstruo extra se validan; la detección automática de movimientos queda para después.
 
 ## Permisos
 
@@ -137,21 +144,24 @@ Las primeras versiones usarán estas zonas como guía visual y destinos elegidos
 |---|---|---|
 | Cuenta | Administrador | Privilegios administrativos globales. No se otorga desde el registro público. |
 | Sala | Jugador | Crea o participa en un duelo y registra acciones de su lado. |
-| Sala | Espectador | Lectura del estado e historial de una sala habilitada para espectadores. Pendiente de implementación. |
+| Sala | Espectador | Requiere invitación por username a una cuenta existente. Solo lectura; un jugador puede revocar el acceso y la invitación expira al terminar el duelo. |
 
 El árbitro o juez será un permiso de sala futuro, con acciones explícitas y limitadas; no debe ser un administrador global.
 
 ## Criterios de aceptación para el MVP completo
 
-- Dos jugadores autenticados pueden entrar a una misma sala mediante código.
-- El tablero real refleja LP, turno, fase y eventos persistidos.
-- Los cambios llegan a ambas sesiones sin recargar.
-- Un teléfono autorizado se vincula con QR temporal que expira.
-- El sistema detecta cuatro marcadores y superpone las zonas correctamente.
-- Una captura propone una carta del deck activo, el usuario la confirma y se registra en la zona elegida.
-- Las impresiones de idiomas, rarezas o artes diferentes no duplican la carta en la lógica del deck.
-- El historial muestra actor, momento, origen de dispositivo y carta asociada.
-- Las pérdidas de conexión, cámara o calibración se muestran como error y no producen cambios parciales.
+- [x] Dos jugadores autenticados pueden entrar a una misma sala mediante código.
+- [x] El tablero refleja LP, turno, fase y estado persistidos; los eventos se guardan en la API.
+- [x] Los jugadores registran/mueven copias del deck en zonas y el historial guarda actor, dispositivo, carta y zonas de origen/destino.
+- [x] Las cartas del deck, la mano y las cartas boca abajo ocultan su identidad a otros participantes y espectadores.
+- [x] Los cambios llegan a sesiones conectadas sin recargar; tras una reconexión llega un snapshot autoritativo versionado.
+- [x] Solo participantes e invitados activos pueden consultar el duelo; el espectador no puede cambiar estado ni crear eventos.
+- [x] Un jugador puede invitar y revocar cuentas espectadoras; la revocación cierra su WebSocket y finalizar el duelo retira todos los accesos de espectador.
+- [x] Un teléfono autorizado se vincula con QR de un solo uso que expira a los cinco minutos y recibe una sesión acotada.
+- [x] El scanner detecta los cuatro IDs AprilTag y calcula/dibuja la calibración; falta validación en los dispositivos físicos objetivo.
+- [x] Una captura propone una carta del deck activo, el usuario la confirma y se registra en la zona elegida como evento de fuente `camera`.
+- [x] Las impresiones de idiomas, rarezas o artes diferentes no duplican la carta en la lógica del deck.
+- [x] La cámara/calibración inválida bloquea confirmar; los fallos de red conservan la captura y el ID idempotente evita duplicados. Falta prueba end-to-end física de desconexión/reconexión.
 
 ## Fuera de alcance inicial
 
@@ -163,9 +173,6 @@ El árbitro o juez será un permiso de sala futuro, con acciones explícitas y l
 
 ## Orden de implementación restante
 
-1. Tablero real en `duel/[id]` sobre la API existente.
-2. WebSockets, reconexión y permisos de sala.
-3. Emparejamiento QR y ruta móvil.
-4. Cámara trasera, marcadores y calibración.
-5. Captura puntual, reconocimiento y confirmación.
-6. Evolución a propuestas de movimiento entre fotogramas y validaciones de reglas.
+1. Validar en Android/iOS el certificado HTTPS, permisos de cámara, AprilTags impresos, calibración y OCR.
+2. Añadir pruebas end-to-end con dos jugadores y un teléfono, incluyendo pérdida de red/cámara y reintentos.
+3. Evolucionar más adelante a propuestas entre fotogramas y validaciones de reglas.

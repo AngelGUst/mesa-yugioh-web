@@ -1,0 +1,15 @@
+{
+	admin off
+}
+
+:80 {
+	redir https://{host}{uri} permanent
+}
+
+:443 {
+	tls /etc/caddy/certs/duel.pem /etc/caddy/certs/duel-key.pem
+
+	@backend path /api/* /health /docs* /openapi.json
+	reverse_proxy @backend backend:8000
+	reverse_proxy frontend:3000
+}

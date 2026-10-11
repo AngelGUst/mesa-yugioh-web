@@ -1,6 +1,6 @@
 # Documentación de Duel Assistant
 
-Este directorio centraliza toda la documentación técnica, de producto y de arquitectura del proyecto **Duel Assistant**.
+Este directorio centraliza toda la documentación técnica, de producto y de arquitectura de **Duel Assistant**. Estado revisado en octubre de 2026: tablero por zonas, historial auditable, sincronización versionada, espectadores privados y flujo inicial de cámara implementados; validación en dispositivos físicos pendiente.
 
 ---
 

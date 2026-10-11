@@ -1,90 +1,77 @@
-# Duel Assistant — Propuesta y Plan de Integración PWA (Progressive Web App)
+# Duel Assistant — Estado de Integración PWA (Progressive Web App)
 
 **Fecha:** Octubre de 2026  
-**Objetivo:** Transformar Duel Assistant en una PWA con descarga progresiva de recursos en segundo plano, caché local de cartas y modo instalable para móviles y PC.
+**Objetivo:** documentar la PWA implementada: recursos de aplicación precargados, caché local de imágenes y modo instalable para móviles y PC.
 
 ---
 
-## 1. ¿Afecta al MVP actual?
+## 1. Estado e impacto en el MVP
 
-**Respuesta: NO afecta negativamente ni rompe nada del MVP.**
+El manifiesto, los iconos y el service worker están implementados. La PWA mejora la carga de recursos estáticos, pero **no ofrece partidas offline**: autenticación, API y sincronización de duelos requieren conexión.
 
-La integración de una PWA se basa en el principio de **mejora progresiva (*Progressive Enhancement*)**:
-* **Cero cambios en Backend:** FastAPI, SQLAlchemy, PostgreSQL, la autenticación JWT y los endpoints se mantienen **100% idénticos**.
-* **Cero cambios en la base de datos:** No se tocan tablas ni migraciones.
-* **Tolerancia a fallos:** Si un navegador antiguo o una conexión no soporta Service Workers, la aplicación sigue funcionando exactamente igual como hasta hoy por HTTP estándar.
-* **Beneficio directo a la Fase 8 (Celular como cámara):** Al ser PWA, el celular puede "instalar" la app, ejecutándose en pantalla completa sin barra de navegación del navegador (Chrome/Safari), lo que otorga más espacio para el visor de la cámara.
+El service worker omite las peticiones `GET` a `/api/*`. Las conexiones WebSocket no usan el evento `fetch` del service worker; su sincronización se gestiona directamente entre navegador y backend. El trabajo de revisiones/snapshots del WebSocket sí incluye cambios separados en backend y base de datos.
+
+El scanner requiere HTTPS para `getUserMedia`. El worker/WASM de AprilTag se sirve localmente desde el build PWA; Tesseract.js descarga el modelo OCR inglés en el primer uso. Si esa descarga falla, el usuario puede elegir manualmente una candidata del deck, pero el camera pairing y el registro siguen necesitando API/red.
+
+El escáner usa `getUserMedia` en un contexto seguro (HTTPS o localhost). AprilTagJS/WASM se sirve localmente desde los assets del frontend. Tesseract.js ejecuta OCR en el dispositivo, pero descarga el modelo de idioma en el primer uso; si no hay conexión o falla esa descarga, se puede elegir manualmente una candidata del deck.
+
+La app conserva su funcionamiento web normal cuando un navegador no soporta service workers; simplemente no obtiene caché offline ni instalación PWA.
 
 ---
 
-## 2. ¿Qué tanto código se moverá? (Alcance del cambio)
+## 2. Archivos implementados
 
-El cambio es **mínimo y estrictamente aditivo** (se añaden archivos nuevos sin reescribir la lógica existente):
+La integración PWA existente usa estos archivos:
 
 ```text
 frontend/
 ├── static/
-│   ├── manifest.json            [NUEVO] Configuración de la PWA (nombre, tema, iconos)
-│   └── icons/                   [NUEVO] Iconos de la app (192x192 y 512x512)
+│   ├── manifest.json            Configuración de nombre, tema e instalación
+│   └── icons/                   Iconos de la app (192x192 y 512x512)
 ├── src/
-│   ├── app.html                 [MODIFICADO] 2 líneas para enlazar el manifest y theme-color
-│   └── service-worker.ts        [NUEVO] Service worker nativo de SvelteKit (lógica de caché)
+│   ├── app.html                 Enlace al manifest y theme-color
+│   └── service-worker.ts        Service worker nativo de SvelteKit
 ```
 
 ### Detalle de modificaciones:
 
 | Archivo | Acción | Impacto |
 |---|---|---|
-| `backend/*` | **Ninguna** | 0% cambios. |
-| `frontend/src/app.html` | **Modificar** | Añadir `<link rel="manifest" href="/manifest.json">` y `<meta name="theme-color" content="#101812">`. |
-| `frontend/static/manifest.json` | **Crear** | Define el nombre "Duel Assistant", colores oscuros y comportamiento `standalone` (app independiente). |
-| `frontend/src/service-worker.ts` | **Crear** | SvelteKit compila automáticamente este archivo y le inyecta la lista de todos los assets generados para descargarlos en segundo plano. |
+| `backend/*` | Sin cambios para la función PWA | El WebSocket versionado es una función aparte y sí usa backend/base de datos. |
+| `frontend/src/app.html` | Implementado | Enlaza `/manifest.json` y configura el tema visual. |
+| `frontend/static/manifest.json` | Implementado | Define nombre, colores, `standalone` e iconos. |
+| `frontend/src/service-worker.ts` | Implementado | Precarga assets de build y aplica reglas de caché por tipo de recurso. |
+| `frontend/static/vendor/apriltag-js/` | Implementado | Worker y WASM local para la familia AprilTag `tagStandard41h12`, con licencia y NOTICE. |
 
 ---
 
-## 3. Estrategia de Caché Progresiva propuesta
+## 3. Estrategia de caché implementada
 
 No todos los datos se deben cachear igual. Para no interferir con las partidas en vivo, se dividen en 3 niveles:
 
-```text
-┌────────────────────────────────────────────────────────────────────────┐
-│                        ESTRATEGIA DE CACHÉ                             │
-├──────────────────────────┬───────────────────────┬─────────────────────┤
-│ Tipo de Recurso          │ Estrategia            │ Comportamiento      │
-├──────────────────────────┼───────────────────────┼─────────────────────┤
-│ 1. Assets de la App      │ Cache-First           │ Se descargan en 2°  │
-│    (HTML, JS, CSS, fonts)│ (Precarga silenciosa) │ plano. Carga en 0ms │
-│                          │                       │ la próxima vez.     │
-├──────────────────────────┼───────────────────────┼─────────────────────┤
-│ 2. Imágenes de Cartas    │ Stale-While-Revalidate│ Se guardan en disco │
-│    (YGOProDeck CDN)      │ con límite de tamaño  │ local al verse. No  │
-│                          │                       │ vuelven a gastar red│
-├──────────────────────────┼───────────────────────┼─────────────────────┤
-│ 3. API y WebSockets      │ Network-Only          │ NUNCA se cachean.   │
-│    (Duelos, LP, turnos)  │ (Siempre en vivo)     │ Datos 100% frescos  │
-│                          │                       │ garantizados.       │
-└──────────────────────────┴───────────────────────┴─────────────────────┘
-```
+| Tipo de recurso | Estrategia implementada | Comportamiento |
+|---|---|---|
+| Assets incluidos en el build | Cache-first y precarga durante instalación | Se solicitan por red si no están en caché. |
+| Imágenes de cartas | Cache-first al primer acceso | Se conservan localmente; no hay límite ni expulsión configurados. |
+| `GET /api/*` | Network-only desde el service worker | El service worker no responde desde su caché; API y autenticación requieren conexión. |
+| WebSocket | Fuera del evento `fetch` del service worker | Conexión directa navegador-backend; requiere red para actualizaciones. |
 
 ---
 
 ## 4. Impacto en el servidor modesto (Intel Celeron 847)
 
-Implementar la PWA es especialmente ventajoso para servidores con hardware ajustado:
+La PWA puede reducir peticiones repetidas de assets e imágenes almacenados en los dispositivos. El efecto real depende de clientes y tráfico; no hay benchmarks de CPU, ancho de banda ni latencia registrados.
 
-1. **Ahorro masivo de ancho de banda y CPU:**
-   * Sin PWA: Cada vez que un jugador o espectador abre la página, el Celeron tiene que transferir todos los archivos compilados de SvelteKit.
-   * Con PWA: El Celeron los sirve **una sola vez**. El resto de las sesiones se cargan desde el almacenamiento local del teléfono o PC del usuario.
-2. **Cero saturación por imágenes de cartas:**
-   * Las cartas cacheadas en los dispositivos de los usuarios reducen las peticiones externas y la latencia del cliente a cero.
-3. **CPU dedicada 100% al juego:**
-   * El Celeron solo tendrá que procesar los eventos de WebSockets (turnos, LP y fases), que consumen menos de 1% de CPU.
+1. Los assets precargados pueden servirse desde el dispositivo después de la instalación o visita inicial.
+2. Las imágenes ya vistas pueden reutilizarse desde caché; no se configura actualmente un máximo de almacenamiento.
+3. La caché del cliente no cambia el coste de consultas, escrituras ni conexiones WebSocket del backend.
 
 ---
 
-## 5. Fases de ejecución recomendadas
+## 5. Estado y validación pendiente
 
-1. **Paso 1: Manifiesto e Iconos:** Crear `static/manifest.json` y los iconos básicos.
-2. **Paso 2: Service Worker de SvelteKit:** Implementar `src/service-worker.ts` utilizando las variables nativas de SvelteKit (`$service-worker: build, files, version`).
-3. **Paso 3: Regla de exclusión de API:** Asegurar que `/api/*` y las conexiones WebSocket pasen directo a la red sin tocar la caché.
-4. **Paso 4: Validación PWA:** Probar la instalación en navegador móvil (Android/iOS) y verificar la navegación offline de recursos estáticos.
+1. Manifiesto, iconos y service worker: **implementados**.
+2. Precarga de assets estáticos y exclusión de `GET /api/*`: **implementadas**.
+3. Caché de imágenes: **implementada como cache-first**, sin límite de tamaño ni política de expulsión por ahora.
+4. Instalación y navegación offline en navegadores móviles: **pendiente de validación manual** en Android/iOS.
+5. La caché no sustituye la API: no hay cola offline de escrituras y un duelo no puede continuar sincronizado sin red.

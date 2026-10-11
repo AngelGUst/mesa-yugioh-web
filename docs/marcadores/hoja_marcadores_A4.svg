@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="210mm" height="297mm" viewBox="0 0 210 297">
+  <rect width="210" height="297" fill="#fff" />
+  <g font-family="Arial, sans-serif" fill="#111">
+    <text x="20" y="15" font-size="5">DUEL ASSISTANT - APRILTAG tagStandard41h12</text>
+    <text x="20" y="21" font-size="3">Imprimir en A4 vertical al 100 %. No usar "Ajustar a página".</text>
+  </g>
+  <g image-rendering="pixelated" shape-rendering="crispEdges">
+    <image x="20" y="28" width="50" height="50" preserveAspectRatio="none" xlink:href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAkAAAAJCAYAAADgkQYQAAAAOElEQVR4XmP4DwUMDAwwJhyAxKAYzsCNYTqwAQyTsAGYOIoidA1YTcJJI3PQAYZJeDGyLmTdyGwADR65RztR+ssAAAAASUVORK5CYII=" />
+    <image x="140" y="28" width="50" height="50" preserveAspectRatio="none" xlink:href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAkAAAAJCAYAAADgkQYQAAAANklEQVR4XmP4DwUMDAwwJhzAxBhADIIYWQc6QFIIYWADWE1CVwwXR5dEZ5NuHS4MlcftHpgYAASlyzVXCPCDAAAAAElFTkSuQmCC" />
+    <image x="20" y="153" width="50" height="50" preserveAspectRatio="none" xlink:href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAkAAAAJCAYAAADgkQYQAAAAPElEQVR4XmP4DwUMDAwwJhzAxMAkiIMLoyjCBuCKkHVgkYTRqIpQrMFmHR4TMa2DAQxFuDBcEZouOA3DABbnyzVbVOFwAAAAAElFTkSuQmCC" />
+    <image x="140" y="153" width="50" height="50" preserveAspectRatio="none" xlink:href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAkAAAAJCAYAAADgkQYQAAAAOUlEQVR4XmP4DwUMDAwwJgZgAEniwyiKsAG4IhQOpgkwjCkIAzitw6YJQxEywFCEC4MVw3Rg0Q3HAH3JtkpGGVE6AAAAAElFTkSuQmCC" />
+  </g>
+  <g fill="none" stroke="#333" stroke-width="0.35" stroke-dasharray="1.6 1.2">
+    <rect x="15" y="23" width="60" height="60" />
+    <rect x="135" y="23" width="60" height="60" />
+    <rect x="15" y="148" width="60" height="60" />
+    <rect x="135" y="148" width="60" height="60" />
+  </g>
+  <g font-family="Arial, sans-serif" font-size="3.5" fill="#111">
+    <text x="15" y="90">ID 0 · cortar por línea discontinua</text>
+    <text x="135" y="90">ID 1 · cortar por línea discontinua</text>
+    <text x="15" y="215">ID 2 · cortar por línea discontinua</text>
+    <text x="135" y="215">ID 4 · cortar por línea discontinua</text>
+    <text x="20" y="259">Regla de comprobación: debe medir exactamente 50 mm</text>
+  </g>
+  <path d="M20 268 H70 M20 266 V270 M70 266 V270" fill="none" stroke="#111" stroke-width="0.35" />
+</svg>

@@ -15,7 +15,15 @@ La visión completa del producto —PC como tablero principal y celular como cá
 - CRUD de decks con Main Deck, Extra Deck, Side Deck y una impresión preferida opcional.
 - Creación de salas, selección de deck al crear o unirse y unión mediante código.
 - Persistencia de LP, turno, fase, estado, ganador y eventos de duelo.
+- Tablero persistido por duelo y sincronización WebSocket entre sesiones con snapshot versionado al conectar o reconectar.
+- Registro y movimiento manual de copias del deck por zona, con historial de actor, dispositivo y zonas de origen/destino.
+- El backend valida la sección/cantidad del deck, evita slots ocupados y protege la identidad de cartas privadas o boca abajo.
+- Pairing de cámara por QR one-use, ruta `/scanner`, AprilTag `tagStandard41h12`, calibración geométrica del tapete (homografía con los 4 marcadores en las esquinas) y OCR del deck como sugerencia con confirmación antes de registrar.
+- Salas privadas con espectadores invitados por cuenta: solo lectura, revocables y expirados al finalizar el duelo.
+- PWA instalable con caché de recursos estáticos e imágenes de cartas; las APIs requieren conexión y no se cachean.
 - Protección contra borrar un deck que está seleccionado en un duelo.
+
+El flujo de cámara funciona como prototipo del MVP; falta validarlo físicamente en Android/iOS con el tapete impreso y realizar pruebas end-to-end entre PC y teléfono. El OCR solo propone una carta y siempre requiere confirmación humana. El tapete soportado es el de media mitad (fila de monstruos + fila de mágicas/trampas); para el tapete completo ajusta `MAT_ROWS` y `MAT_LAYOUT` en `frontend/src/lib/config/board.ts`.
 
 ## Ejecutar con Docker
 
@@ -42,8 +50,10 @@ La visión completa del producto —PC como tablero principal y celular como cá
    - Frontend: `http://localhost:5173`
    - API y Swagger: `http://localhost:8000/docs`
    - Salud de la API: `http://localhost:8000/health`
+   - HTTPS local con Caddy: `https://<ip-lan>` (ver [HTTPS_DESARROLLO_LOCAL.md](docs/HTTPS_DESARROLLO_LOCAL.md))
+   - Marcadores del escáner: [docs/marcadores/INSTRUCCIONES.md](docs/marcadores/INSTRUCCIONES.md)
 
-Docker inicia PostgreSQL únicamente en la red interna. No se publica un puerto de base de datos en el host.
+Docker publica PostgreSQL únicamente en el puerto `5433` del host para desarrollo; en producción/LAN debe convivir con la app detrás de Caddy.
 
 > No use `docker compose down -v` salvo que quiera eliminar todos los datos de PostgreSQL del proyecto.
 
@@ -62,6 +72,8 @@ uvicorn main:app --reload --port 8000
 ```
 
 La configuración de `backend\.env` puede usar SQLite para desarrollo local. La API estará en `http://localhost:8000`.
+
+Para probar la PWA y la cámara desde un teléfono, configura HTTPS local con Caddy y mkcert siguiendo [HTTPS_DESARROLLO_LOCAL.md](docs/HTTPS_DESARROLLO_LOCAL.md).
 
 ### Frontend
 
@@ -105,3 +117,5 @@ Para compilar el frontend:
 Set-Location frontend
 npm run build
 ```
+
+La suite del backend verifica el snapshot WebSocket inicial, el incremento de revisiones y la recuperación del estado tras reconectar. Las pruebas end-to-end de navegador y el flujo completo entre dos dispositivos siguen pendientes.
