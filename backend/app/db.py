@@ -50,10 +50,37 @@ def ensure_schema() -> None:
             "name": "VARCHAR(100)",
             "player1_deck_id": "INTEGER",
             "player2_deck_id": "INTEGER",
+            "revision": "INTEGER NOT NULL DEFAULT 1",
         }
         for column, column_type in duel_migrations.items():
             if column not in duel_columns:
                 connection.execute(text(f"ALTER TABLE duels ADD COLUMN {column} {column_type}"))
+
+        spectator_columns = {column["name"] for column in inspect(connection).get_columns("duel_spectators")}
+        if "revoked_at" not in spectator_columns:
+            timestamp_type = "TIMESTAMP WITH TIME ZONE" if connection.dialect.name == "postgresql" else "DATETIME"
+            connection.execute(text(f"ALTER TABLE duel_spectators ADD COLUMN revoked_at {timestamp_type}"))
+
+        event_columns = {column["name"] for column in inspect(connection).get_columns("duel_events")}
+        event_migrations = {
+            "actor_player_id": "INTEGER",
+            "source_device": "VARCHAR(20) NOT NULL DEFAULT 'web'",
+            "card_id": "INTEGER",
+            "duel_card_id": "INTEGER",
+            "source_zone": "VARCHAR(24)",
+            "target_zone": "VARCHAR(24)",
+        }
+        for column, column_type in event_migrations.items():
+            if column not in event_columns:
+                connection.execute(text(f"ALTER TABLE duel_events ADD COLUMN {column} {column_type}"))
+
+        duel_card_columns = {column["name"] for column in inspect(connection).get_columns("duel_cards")}
+        if "client_action_id" not in duel_card_columns:
+            connection.execute(text("ALTER TABLE duel_cards ADD COLUMN client_action_id VARCHAR(36)"))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_duel_card_client_action_id "
+            "ON duel_cards (client_action_id)"
+        ))
 
 
 def _migrate_card_print_identity(connection) -> None:

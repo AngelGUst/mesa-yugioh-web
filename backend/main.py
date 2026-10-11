@@ -1,35 +1,60 @@
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import json
+import secrets
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from app.auth import (
     create_access_token,
     decode_token_player_id,
+    bearer_scheme,
     get_current_player,
     hash_password,
     verify_password,
 )
 from app.db import ensure_schema, get_db
-from app.models import Card, CardPrint, Deck, DeckCard, Duel, DuelEvent, Player
+from app.models import (
+    Card,
+    CardPrint,
+    Deck,
+    DeckCard,
+    Duel,
+    DuelCameraSession,
+    DuelCard,
+    DuelEvent,
+    DuelSpectator,
+    Player,
+)
 from app.websocket_manager import ws_manager
 from app.schemas import (
     CardResponse,
+    CameraDeckCard,
+    CameraCardPlacement,
+    CameraPairingRedeem,
+    CameraSessionInfo,
+    CameraSessionResponse,
     DeckCreate,
     DeckImportRequest,
     DeckResponse,
     DeckUpdate,
     DuelCreate,
+    DuelCardCreate,
+    DuelCardMove,
+    DuelCardResponse,
     DuelEventCreate,
     DuelEventResponse,
     DuelJoin,
     DuelResponse,
+    DuelSpectatorCreate,
+    DuelSpectatorResponse,
     DuelUpdate,
     PlayerCreate,
     PlayerLogin,
@@ -371,15 +396,123 @@ def delete_deck(deck_id: int, player: Player = Depends(get_current_player), db: 
     db.commit()
 
 
-def _duel_viewable(duel_id: int, db: Session) -> Duel:
+def _duel_viewable(duel_id: int, player: Player, db: Session) -> Duel:
     duel = db.scalar(select(Duel).where(Duel.id == duel_id))
-    if duel is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Duelo no encontrado")
+    if duel is None or player.id not in (duel.player1_id, duel.player2_id):
+        invite = db.scalar(
+            select(DuelSpectator.id).where(
+                DuelSpectator.duel_id == duel_id,
+                DuelSpectator.player_id == player.id,
+                DuelSpectator.revoked_at.is_(None),
+            )
+        ) if duel is not None and duel.status != "finished" else None
+        if invite is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Duelo no encontrado")
     return duel
 
 
+def _duel_snapshot_data(duel: Duel, viewer: Player | None = None) -> dict:
+    response = DuelResponse.model_validate(duel).model_dump(mode="json")
+    if viewer is not None:
+        response["viewer_role"] = "player" if viewer.id in (duel.player1_id, duel.player2_id) else "spectator"
+        private_zones = {"main_deck", "extra_deck", "side_deck", "hand"}
+        hidden_card_ids = {
+            card.id for card in duel.cards
+            if viewer.id != card.player_id and (card.face_down or card.zone in private_zones)
+        }
+    else:
+        hidden_card_ids = _globally_hidden_card_ids(duel)
+    _redact_event_card_ids(response["events"], hidden_card_ids)
+    return response
+
+
+def _duel_response_data(duel: Duel, player: Player) -> dict:
+    return _duel_snapshot_data(duel, player)
+
+
+def _active_spectator_invites(duel_id: int, db: Session) -> list[DuelSpectator]:
+    return list(db.scalars(
+        select(DuelSpectator)
+        .where(DuelSpectator.duel_id == duel_id, DuelSpectator.revoked_at.is_(None))
+        .order_by(DuelSpectator.created_at)
+    ).all())
+
+
+def _token_digest(token: str) -> str:
+    return sha256(token.encode("utf-8")).hexdigest()
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _camera_deck_cards(duel: Duel, player: Player, db: Session) -> list[CameraDeckCard]:
+    deck_id = duel.player1_deck_id if duel.player1_id == player.id else duel.player2_deck_id
+    if deck_id is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="El jugador no tiene un deck asignado")
+    entries = db.scalars(select(DeckCard).where(DeckCard.deck_id == deck_id).order_by(DeckCard.card_id)).all()
+    return [
+        CameraDeckCard(
+            card_id=entry.card_id,
+            name=entry.card.name,
+            section=entry.section,
+            quantity=entry.quantity,
+            preferred_print_id=entry.preferred_print_id,
+            image_url_small=entry.card.image_url_small,
+        )
+        for entry in entries
+    ]
+
+
+def _camera_session_context(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> tuple[DuelCameraSession, Duel, Player]:
+    if credentials is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sesión de cámara requerida")
+    session = db.scalar(select(DuelCameraSession).where(
+        DuelCameraSession.camera_token_hash == _token_digest(credentials.credentials),
+        DuelCameraSession.revoked_at.is_(None),
+    ))
+    now = datetime.now(timezone.utc)
+    if session is None or session.session_expires_at is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sesión de cámara inválida")
+    expires_at = session.session_expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= now:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sesión de cámara expirada")
+
+    duel = db.get(Duel, session.duel_id)
+    player = db.scalar(select(Player).where(Player.id == session.player_id, Player.is_active.is_(True)))
+    if duel is None or duel.status == "finished" or player is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="La sesión de cámara ya no está activa")
+    return session, duel, player
+
+
+def _camera_session_data(duel: Duel, player: Player, db: Session) -> dict:
+    expires = db.scalar(select(DuelCameraSession.session_expires_at).where(
+        DuelCameraSession.duel_id == duel.id,
+        DuelCameraSession.player_id == player.id,
+        DuelCameraSession.revoked_at.is_(None),
+        DuelCameraSession.session_expires_at.is_not(None),
+    ).order_by(DuelCameraSession.created_at.desc()).limit(1))
+    return {
+        "expires_at": _utc_datetime(expires) if expires is not None else None,
+        "duel_id": duel.id,
+        "duel_code": duel.duel_code,
+        "player_id": player.id,
+        "player_username": player.username,
+        "deck_cards": _camera_deck_cards(duel, player, db),
+    }
+
+
 def _duel_for_player(duel_id: int, player: Player, db: Session) -> Duel:
-    duel = _duel_viewable(duel_id, db)
+    duel = db.scalar(select(Duel).where(Duel.id == duel_id).with_for_update())
+    if duel is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Duelo no encontrado")
     if duel.player1_id != player.id and duel.player2_id != player.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tienes permisos de jugador en este duelo")
     return duel
@@ -390,6 +523,97 @@ def _owned_deck_or_none(deck_id: int | None, player: Player, db: Session) -> int
         return None
     _owned_deck(deck_id, player, db)
     return deck_id
+
+
+def _bump_duel_revision(duel: Duel, db: Session) -> None:
+    db.flush()
+    db.execute(
+        update(Duel)
+        .where(Duel.id == duel.id)
+        .values(revision=Duel.revision + 1)
+    )
+    db.refresh(duel, attribute_names=["revision"])
+
+
+def _resolve_duel_card_position(
+    duel_id: int,
+    player_id: int,
+    zone: str,
+    position: int | None,
+    db: Session,
+    exclude_card_id: int | None = None,
+) -> int:
+    fixed_slots = {"monster_zone": 4, "spell_trap_zone": 4, "extra_monster": 1, "pendulum": 1}
+    single_slots = {"field_spell"}
+    if zone in single_slots:
+        position = 0
+    elif zone in fixed_slots:
+        if position is None or position > fixed_slots[zone]:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="La zona requiere una posición válida")
+    elif position is None:
+        last_position = db.scalar(select(DuelCard.position).where(
+            DuelCard.duel_id == duel_id,
+            DuelCard.player_id == player_id,
+            DuelCard.zone == zone,
+        ).order_by(DuelCard.position.desc()).limit(1))
+        position = (last_position + 1) if last_position is not None else 0
+
+    occupancy_query = select(DuelCard.id).where(
+        DuelCard.duel_id == duel_id,
+        DuelCard.zone == zone,
+        DuelCard.position == position,
+    )
+    if zone != "extra_monster":
+        occupancy_query = occupancy_query.where(DuelCard.player_id == player_id)
+    if exclude_card_id is not None:
+        occupancy_query = occupancy_query.where(DuelCard.id != exclude_card_id)
+    occupied = db.scalar(occupancy_query)
+    if occupied is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Esa posición de la zona ya está ocupada")
+    return position
+
+
+def _duel_card_response(card: DuelCard, viewer: Player) -> dict:
+    data = DuelCardResponse.model_validate(card).model_dump(mode="json")
+    private_zone = card.zone in {"main_deck", "extra_deck", "side_deck", "hand"}
+    hidden = viewer.id != card.player_id and (private_zone or card.face_down)
+    if hidden:
+        data["card_id"] = None
+        data["card_name"] = "Carta oculta"
+        data["image_url"] = None
+        data["preferred_print_id"] = None
+    data["hidden"] = hidden
+    return data
+
+
+def _globally_hidden_card_ids(duel: Duel) -> set[int]:
+    private_zones = {"main_deck", "extra_deck", "side_deck", "hand"}
+    return {
+        card.id for card in duel.cards
+        if card.face_down or card.zone in private_zones
+    }
+
+
+def _redact_event_card_ids(events: list[dict], hidden_card_ids: set[int]) -> None:
+    for event in events:
+        if event.get("duel_card_id") in hidden_card_ids:
+            event["card_id"] = None
+            event["duel_card_id"] = None
+
+
+def _broadcast_duel_event(duel: Duel, event: DuelEvent) -> None:
+    hidden_card_ids = _globally_hidden_card_ids(duel)
+    event_data = DuelEventResponse.model_validate(event).model_dump(mode="json")
+    if event.duel_card_id in hidden_card_ids:
+        event_data["card_id"] = None
+        event_data["duel_card_id"] = None
+    duel_data = _duel_snapshot_data(duel)
+    ws_manager.broadcast_sync(duel.id, {
+        "type": "DUEL_EVENT",
+        "revision": duel.revision,
+        "event": event_data,
+        "duel": duel_data,
+    })
 
 
 @app.post("/api/duels", response_model=DuelResponse, status_code=status.HTTP_201_CREATED)
@@ -408,7 +632,7 @@ def create_duel(payload: DuelCreate, player: Player = Depends(get_current_player
 
 @app.post("/api/duels/join", response_model=DuelResponse)
 def join_duel(payload: DuelJoin, player: Player = Depends(get_current_player), db: Session = Depends(get_db)) -> Duel:
-    duel = db.scalar(select(Duel).where(Duel.duel_code == payload.duel_code.upper()))
+    duel = db.scalar(select(Duel).where(Duel.duel_code == payload.duel_code.upper()).with_for_update())
     if duel is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sala no encontrada")
     if duel.player1_id == player.id:
@@ -418,41 +642,412 @@ def join_duel(payload: DuelJoin, player: Player = Depends(get_current_player), d
     duel.player2_id = player.id
     duel.player2_deck_id = _owned_deck_or_none(payload.deck_id, player, db)
     duel.status = "active"
+    _bump_duel_revision(duel, db)
     db.commit()
     db.refresh(duel)
 
     ws_manager.broadcast_sync(duel.id, {
         "type": "DUEL_UPDATED",
-        "duel": DuelResponse.model_validate(duel).model_dump(mode="json"),
+        "revision": duel.revision,
+        "duel": _duel_snapshot_data(duel),
     })
     return duel
 
 
 @app.get("/api/duels", response_model=list[DuelResponse])
-def list_duels(player: Player = Depends(get_current_player), db: Session = Depends(get_db)) -> list[Duel]:
-    return list(db.scalars(select(Duel).where((Duel.player1_id == player.id) | (Duel.player2_id == player.id)).order_by(Duel.created_at.desc())).all())
+def list_duels(player: Player = Depends(get_current_player), db: Session = Depends(get_db)) -> list[dict]:
+    spectator_duels = select(DuelSpectator.duel_id).where(
+        DuelSpectator.player_id == player.id,
+        DuelSpectator.revoked_at.is_(None),
+    )
+    duels = db.scalars(
+        select(Duel)
+        .where(or_(Duel.player1_id == player.id, Duel.player2_id == player.id, Duel.id.in_(spectator_duels)))
+        .order_by(Duel.created_at.desc())
+    ).all()
+    visible_duels = [
+        duel for duel in duels
+        if duel.status != "finished" or player.id in (duel.player1_id, duel.player2_id)
+    ]
+    return [_duel_response_data(duel, player) for duel in visible_duels]
 
 
 @app.get("/api/duels/{duel_id}", response_model=DuelResponse)
-def get_duel(duel_id: int, player: Player = Depends(get_current_player), db: Session = Depends(get_db)) -> Duel:
-    return _duel_viewable(duel_id, db)
+def get_duel(duel_id: int, player: Player = Depends(get_current_player), db: Session = Depends(get_db)) -> dict:
+    return _duel_response_data(_duel_viewable(duel_id, player, db), player)
+
+
+@app.post("/api/duels/{duel_id}/camera-pairings")
+def create_camera_pairing(
+    duel_id: int,
+    player: Player = Depends(get_current_player),
+    db: Session = Depends(get_db),
+) -> dict:
+    duel = _duel_for_player(duel_id, player, db)
+    if duel.status == "finished":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="El duelo ya terminó")
+    deck_id = duel.player1_deck_id if duel.player1_id == player.id else duel.player2_deck_id
+    if deck_id is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Asigna un deck antes de vincular la cámara")
+
+    now = datetime.now(timezone.utc)
+    existing = db.scalars(select(DuelCameraSession).where(
+        DuelCameraSession.duel_id == duel.id,
+        DuelCameraSession.player_id == player.id,
+        DuelCameraSession.revoked_at.is_(None),
+        DuelCameraSession.paired_at.is_(None),
+    ).with_for_update()).all()
+    for old_pairing in existing:
+        old_pairing.revoked_at = now
+
+    pairing_token = secrets.token_urlsafe(32)
+    pairing = DuelCameraSession(
+        duel_id=duel.id,
+        player_id=player.id,
+        pairing_token_hash=_token_digest(pairing_token),
+        pairing_expires_at=now + timedelta(minutes=5),
+    )
+    db.add(pairing)
+    db.commit()
+    return {
+        "pairing_token": pairing_token,
+        "expires_at": _utc_datetime(pairing.pairing_expires_at),
+        "duel_id": duel.id,
+        "duel_code": duel.duel_code,
+    }
+
+
+@app.post("/api/camera-pairings/redeem", response_model=CameraSessionResponse)
+def redeem_camera_pairing(
+    payload: CameraPairingRedeem,
+    db: Session = Depends(get_db),
+) -> CameraSessionResponse:
+    pairing = db.scalar(select(DuelCameraSession).where(
+        DuelCameraSession.pairing_token_hash == _token_digest(payload.pairing_token),
+    ).with_for_update())
+    now = datetime.now(timezone.utc)
+    if pairing is None or pairing.revoked_at is not None or pairing.paired_at is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El código QR no es válido o ya fue utilizado")
+    expires_at = pairing.pairing_expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= now:
+        pairing.revoked_at = now
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="El código QR expiró; genera uno nuevo desde el tablero")
+
+    duel = db.get(Duel, pairing.duel_id)
+    player = db.scalar(select(Player).where(Player.id == pairing.player_id, Player.is_active.is_(True)))
+    if duel is None or duel.status == "finished" or player is None:
+        pairing.revoked_at = now
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="El duelo ya no admite cámaras")
+
+    camera_token = secrets.token_urlsafe(32)
+    pairing.paired_at = now
+    pairing.camera_token_hash = _token_digest(camera_token)
+    pairing.session_expires_at = now + timedelta(hours=12)
+    db.commit()
+    return CameraSessionResponse(
+        camera_token=camera_token,
+        expires_at=_utc_datetime(pairing.session_expires_at),
+        duel_id=duel.id,
+        duel_code=duel.duel_code,
+        player_id=player.id,
+        player_username=player.username,
+        deck_cards=_camera_deck_cards(duel, player, db),
+    )
+
+
+@app.get("/api/camera-session", response_model=CameraSessionInfo)
+def get_camera_session(
+    context: tuple[DuelCameraSession, Duel, Player] = Depends(_camera_session_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    _, duel, player = context
+    return _camera_session_data(duel, player, db)
+
+
+@app.get("/api/camera-session/cards", response_model=list[DuelCardResponse])
+def list_camera_board_cards(
+    context: tuple[DuelCameraSession, Duel, Player] = Depends(_camera_session_context),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    _, duel, player = context
+    cards = db.scalars(
+        select(DuelCard)
+        .where(DuelCard.duel_id == duel.id)
+        .order_by(DuelCard.created_at)
+    ).all()
+    return [_duel_card_response(card, player) for card in cards]
+
+
+@app.post("/api/camera-session/revoke", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_camera_session(
+    context: tuple[DuelCameraSession, Duel, Player] = Depends(_camera_session_context),
+    db: Session = Depends(get_db),
+) -> None:
+    camera_session, _, _ = context
+    camera_session.revoked_at = datetime.now(timezone.utc)
+    db.commit()
+
+
+@app.get("/api/duels/{duel_id}/cards", response_model=list[DuelCardResponse])
+def list_duel_cards(
+    duel_id: int,
+    player: Player = Depends(get_current_player),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    _duel_viewable(duel_id, player, db)
+    cards = db.scalars(select(DuelCard).where(DuelCard.duel_id == duel_id).order_by(DuelCard.created_at)).all()
+    return [_duel_card_response(card, player) for card in cards]
+
+
+def _place_duel_card(
+    duel_id: int,
+    payload: DuelCardCreate,
+    player: Player,
+    db: Session,
+    client_action_id: str | None = None,
+) -> dict:
+    duel = _duel_for_player(duel_id, player, db)
+    if duel.status == "finished":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No se pueden modificar las cartas de un duelo terminado")
+    if client_action_id is not None:
+        previous_action = db.scalar(select(DuelCard).where(DuelCard.client_action_id == client_action_id))
+        if previous_action is not None:
+            if previous_action.duel_id != duel.id or previous_action.player_id != player.id:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="El ID de captura ya fue utilizado")
+            return _duel_card_response(previous_action, player)
+
+    deck_id = duel.player1_deck_id if duel.player1_id == player.id else duel.player2_deck_id
+    if deck_id is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Selecciona un deck para este duelo antes de registrar cartas")
+    expected_section = {"main_deck": "main", "extra_deck": "extra", "side_deck": "side"}[payload.source_zone]
+    deck_entry = db.scalar(select(DeckCard).where(
+        DeckCard.deck_id == deck_id,
+        DeckCard.card_id == payload.card_id,
+        DeckCard.section == expected_section,
+    ))
+    if deck_entry is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La carta no pertenece a esa sección del deck seleccionado")
+    placed_count = len(db.scalars(select(DuelCard.id).where(
+        DuelCard.duel_id == duel.id,
+        DuelCard.player_id == player.id,
+        DuelCard.card_id == payload.card_id,
+    )).all())
+    if placed_count >= deck_entry.quantity:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ya registraste todas las copias de esta carta de tu deck")
+    if payload.preferred_print_id is not None:
+        preferred_print = db.get(CardPrint, payload.preferred_print_id)
+        if preferred_print is None or preferred_print.card_id != payload.card_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La impresión seleccionada no pertenece a la carta")
+
+    position = _resolve_duel_card_position(duel.id, player.id, payload.zone, payload.position, db)
+    duel_card = DuelCard(
+        duel_id=duel.id,
+        card_id=payload.card_id,
+        player_id=player.id,
+        zone=payload.zone,
+        position=position,
+        face_down=payload.face_down,
+        preferred_print_id=payload.preferred_print_id,
+        created_by_player_id=player.id,
+        updated_by_player_id=player.id,
+        client_action_id=client_action_id,
+    )
+    db.add(duel_card)
+    db.flush()
+    event = DuelEvent(
+        duel_id=duel.id,
+        event_type="CARD_PLACED",
+        payload={"position": position, "face_down": payload.face_down},
+        actor_player_id=player.id,
+        source_device=payload.source_device,
+        card_id=payload.card_id,
+        duel_card_id=duel_card.id,
+        source_zone=payload.source_zone,
+        target_zone=payload.zone,
+    )
+    db.add(event)
+    _bump_duel_revision(duel, db)
+    db.commit()
+    db.refresh(duel_card)
+    db.refresh(event)
+    db.refresh(duel)
+    _broadcast_duel_event(duel, event)
+    return _duel_card_response(duel_card, player)
+
+
+@app.post("/api/duels/{duel_id}/cards", response_model=DuelCardResponse, status_code=status.HTTP_201_CREATED)
+def place_duel_card(
+    duel_id: int,
+    payload: DuelCardCreate,
+    player: Player = Depends(get_current_player),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _place_duel_card(duel_id, payload, player, db)
+
+
+@app.post("/api/camera-session/cards", response_model=DuelCardResponse, status_code=status.HTTP_201_CREATED)
+def camera_place_duel_card(
+    payload: CameraCardPlacement,
+    context: tuple[DuelCameraSession, Duel, Player] = Depends(_camera_session_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    _, duel, player = context
+    camera_payload = payload.model_copy(update={"source_device": "camera"})
+    return _place_duel_card(duel.id, camera_payload, player, db, str(payload.client_action_id))
+
+
+@app.put("/api/duels/{duel_id}/cards/{duel_card_id}", response_model=DuelCardResponse)
+def move_duel_card(
+    duel_id: int,
+    duel_card_id: int,
+    payload: DuelCardMove,
+    player: Player = Depends(get_current_player),
+    db: Session = Depends(get_db),
+) -> dict:
+    duel = _duel_for_player(duel_id, player, db)
+    if duel.status == "finished":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No se pueden modificar las cartas de un duelo terminado")
+    duel_card = db.scalar(select(DuelCard).where(
+        DuelCard.id == duel_card_id,
+        DuelCard.duel_id == duel.id,
+    ).with_for_update())
+    if duel_card is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Carta del duelo no encontrada")
+    if duel_card.player_id != player.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Solo puedes mover cartas de tu lado del tablero")
+
+    source_zone = duel_card.zone
+    position = _resolve_duel_card_position(
+        duel.id, player.id, payload.zone, payload.position, db, exclude_card_id=duel_card.id
+    )
+    duel_card.zone = payload.zone
+    duel_card.position = position
+    duel_card.face_down = payload.face_down
+    duel_card.updated_by_player_id = player.id
+    duel_card.updated_at = datetime.now(timezone.utc)
+    event = DuelEvent(
+        duel_id=duel.id,
+        event_type="CARD_MOVED",
+        payload={"position": position, "face_down": payload.face_down},
+        actor_player_id=player.id,
+        source_device=payload.source_device,
+        card_id=duel_card.card_id,
+        duel_card_id=duel_card.id,
+        source_zone=source_zone,
+        target_zone=payload.zone,
+    )
+    db.add(event)
+    _bump_duel_revision(duel, db)
+    db.commit()
+    db.refresh(duel_card)
+    db.refresh(event)
+    db.refresh(duel)
+    _broadcast_duel_event(duel, event)
+    return _duel_card_response(duel_card, player)
+
+
+@app.get("/api/duels/{duel_id}/spectators", response_model=list[DuelSpectatorResponse])
+def list_duel_spectators(
+    duel_id: int,
+    player: Player = Depends(get_current_player),
+    db: Session = Depends(get_db),
+) -> list[DuelSpectator]:
+    duel = _duel_for_player(duel_id, player, db)
+    if duel.status == "finished":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="El duelo está terminado")
+    return _active_spectator_invites(duel_id, db)
+
+
+@app.post("/api/duels/{duel_id}/spectators", response_model=DuelSpectatorResponse, status_code=status.HTTP_201_CREATED)
+def invite_duel_spectator(
+    duel_id: int,
+    payload: DuelSpectatorCreate,
+    player: Player = Depends(get_current_player),
+    db: Session = Depends(get_db),
+) -> DuelSpectator:
+    duel = _duel_for_player(duel_id, player, db)
+    if duel.status == "finished":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No se pueden invitar espectadores a un duelo terminado")
+    spectator = db.scalar(select(Player).where(Player.username == payload.username, Player.is_active.is_(True)))
+    if spectator is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cuenta de espectador no encontrada")
+    if spectator.id in (duel.player1_id, duel.player2_id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Los jugadores ya tienen acceso al duelo")
+    existing_invite = db.scalar(select(DuelSpectator).where(
+        DuelSpectator.duel_id == duel.id,
+        DuelSpectator.player_id == spectator.id,
+    ))
+    if existing_invite is not None and existing_invite.revoked_at is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Esta cuenta ya está invitada")
+
+    if existing_invite is None:
+        invite = DuelSpectator(duel_id=duel.id, player_id=spectator.id, invited_by_id=player.id)
+        db.add(invite)
+    else:
+        invite = existing_invite
+        invite.revoked_at = None
+        invite.invited_by_id = player.id
+        invite.created_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(invite)
+    return invite
+
+
+@app.delete("/api/duels/{duel_id}/spectators/{spectator_player_id}", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_duel_spectator(
+    duel_id: int,
+    spectator_player_id: int,
+    player: Player = Depends(get_current_player),
+    db: Session = Depends(get_db),
+) -> None:
+    duel = _duel_for_player(duel_id, player, db)
+    invite = db.scalar(select(DuelSpectator).where(
+        DuelSpectator.duel_id == duel.id,
+        DuelSpectator.player_id == spectator_player_id,
+        DuelSpectator.revoked_at.is_(None),
+    ).with_for_update())
+    if invite is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invitación activa no encontrada")
+    invite.revoked_at = datetime.now(timezone.utc)
+    db.commit()
+    ws_manager.close_player_connections_sync(duel.id, spectator_player_id)
 
 
 @app.put("/api/duels/{duel_id}", response_model=DuelResponse)
 def update_duel(duel_id: int, payload: DuelUpdate, player: Player = Depends(get_current_player), db: Session = Depends(get_db)) -> Duel:
     duel = _duel_for_player(duel_id, player, db)
+    was_finished = duel.status == "finished"
     changes = payload.model_dump(exclude_unset=True)
     for field, value in changes.items():
         setattr(duel, field, value)
     if duel.status == "finished" and duel.finished_at is None:
         duel.finished_at = datetime.now(timezone.utc)
+    if changes:
+        _bump_duel_revision(duel, db)
+    revoked_spectator_ids: list[int] = []
+    if duel.status == "finished" and not was_finished:
+        for invite in _active_spectator_invites(duel.id, db):
+            invite.revoked_at = datetime.now(timezone.utc)
+            revoked_spectator_ids.append(invite.player_id)
+        for camera_session in db.scalars(select(DuelCameraSession).where(
+            DuelCameraSession.duel_id == duel.id,
+            DuelCameraSession.revoked_at.is_(None),
+        )).all():
+            camera_session.revoked_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(duel)
 
     ws_manager.broadcast_sync(duel.id, {
         "type": "DUEL_UPDATED",
-        "duel": DuelResponse.model_validate(duel).model_dump(mode="json"),
+        "revision": duel.revision,
+        "duel": _duel_snapshot_data(duel),
     })
+    for spectator_id in revoked_spectator_ids:
+        ws_manager.close_player_connections_sync(duel.id, spectator_id)
     return duel
 
 
@@ -466,15 +1061,21 @@ def delete_duel(duel_id: int, player: Player = Depends(get_current_player), db: 
 @app.post("/api/duels/{duel_id}/events", response_model=DuelEventResponse, status_code=status.HTTP_201_CREATED)
 def add_duel_event(duel_id: int, payload: DuelEventCreate, player: Player = Depends(get_current_player), db: Session = Depends(get_db)) -> DuelEvent:
     duel = _duel_for_player(duel_id, player, db)
-    event = DuelEvent(duel_id=duel.id, event_type=payload.event_type, payload=payload.payload)
+    if duel.status == "finished":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No se pueden registrar eventos en un duelo terminado")
+    event = DuelEvent(
+        duel_id=duel.id,
+        event_type=payload.event_type,
+        payload=payload.payload,
+        actor_player_id=player.id,
+        source_device=payload.source_device,
+    )
     db.add(event)
+    _bump_duel_revision(duel, db)
     db.commit()
     db.refresh(event)
 
-    ws_manager.broadcast_sync(duel.id, {
-        "type": "DUEL_EVENT",
-        "event": DuelEventResponse.model_validate(event).model_dump(mode="json"),
-    })
+    _broadcast_duel_event(duel, event)
     return event
 
 
@@ -491,17 +1092,32 @@ async def duel_websocket(
         return
 
     player_id = decode_token_player_id(token)
-    role = "spectator"
-    if player_id is not None and (duel.player1_id == player_id or duel.player2_id == player_id):
-        role = "player"
+    account = db.scalar(select(Player).where(Player.id == player_id, Player.is_active.is_(True))) if player_id else None
+    is_player = account is not None and player_id in (duel.player1_id, duel.player2_id)
+    invite = db.scalar(select(DuelSpectator.id).where(
+        DuelSpectator.duel_id == duel_id,
+        DuelSpectator.player_id == player_id,
+        DuelSpectator.revoked_at.is_(None),
+    )) if account is not None and not is_player and duel.status != "finished" else None
+    if account is None or (not is_player and invite is None):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    role = "player" if is_player else "spectator"
 
-    await ws_manager.connect(duel_id, websocket)
+    await ws_manager.connect(duel_id, websocket, player_id)
 
     await websocket.send_json({
         "type": "CONNECTED",
         "duel_id": duel_id,
         "role": role,
         "player_id": player_id,
+    })
+    db.expire(duel)
+    db.refresh(duel)
+    await websocket.send_json({
+        "type": "DUEL_STATE",
+        "revision": duel.revision,
+        "duel": _duel_snapshot_data(duel, account),
     })
 
     try:

@@ -128,6 +128,7 @@ class Duel(Base):
     turn: Mapped[int] = mapped_column(Integer, default=1)
     current_phase: Mapped[str] = mapped_column(String(50), default="DRAW_PHASE")
     current_player: Mapped[int] = mapped_column(Integer, default=1)
+    revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     winner_id: Mapped[int | None] = mapped_column(ForeignKey(PLAYER_ID_FOREIGN_KEY))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -137,6 +138,9 @@ class Duel(Base):
     player1_deck: Mapped[Deck | None] = relationship(foreign_keys=[player1_deck_id])
     player2_deck: Mapped[Deck | None] = relationship(foreign_keys=[player2_deck_id])
     events: Mapped[list["DuelEvent"]] = relationship(back_populates="duel", cascade=CASCADING_DELETE)
+    cards: Mapped[list["DuelCard"]] = relationship(back_populates="duel", cascade=CASCADING_DELETE)
+    spectator_grants: Mapped[list["DuelSpectator"]] = relationship(back_populates="duel", cascade=CASCADING_DELETE)
+    camera_sessions: Mapped[list["DuelCameraSession"]] = relationship(back_populates="duel", cascade=CASCADING_DELETE)
 
     @property
     def player1_username(self) -> str:
@@ -154,6 +158,92 @@ class DuelEvent(Base):
     duel_id: Mapped[int] = mapped_column(ForeignKey("duels.id", ondelete="CASCADE"), index=True)
     event_type: Mapped[str] = mapped_column(String(50))
     payload: Mapped[dict | None] = mapped_column(JSON)
+    actor_player_id: Mapped[int | None] = mapped_column(ForeignKey(PLAYER_ID_FOREIGN_KEY))
+    source_device: Mapped[str] = mapped_column(String(20), default="web", nullable=False)
+    card_id: Mapped[int | None] = mapped_column(ForeignKey("cards.id"))
+    duel_card_id: Mapped[int | None] = mapped_column(ForeignKey("duel_cards.id"))
+    source_zone: Mapped[str | None] = mapped_column(String(24))
+    target_zone: Mapped[str | None] = mapped_column(String(24))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     duel: Mapped[Duel] = relationship(back_populates="events")
+    actor: Mapped[Player | None] = relationship(foreign_keys=[actor_player_id])
+    duel_card: Mapped["DuelCard | None"] = relationship(foreign_keys=[duel_card_id])
+
+    @property
+    def actor_username(self) -> str | None:
+        return self.actor.username if self.actor else None
+
+
+class DuelSpectator(Base):
+    __tablename__ = "duel_spectators"
+    __table_args__ = (UniqueConstraint("duel_id", "player_id", name="uq_duel_spectator"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    duel_id: Mapped[int] = mapped_column(ForeignKey("duels.id", ondelete="CASCADE"), index=True)
+    player_id: Mapped[int] = mapped_column(ForeignKey(PLAYER_ID_FOREIGN_KEY, ondelete="CASCADE"), index=True)
+    invited_by_id: Mapped[int] = mapped_column(ForeignKey(PLAYER_ID_FOREIGN_KEY, ondelete="CASCADE"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    duel: Mapped[Duel] = relationship(back_populates="spectator_grants")
+    player: Mapped[Player] = relationship(foreign_keys=[player_id])
+    invited_by: Mapped[Player] = relationship(foreign_keys=[invited_by_id])
+
+    @property
+    def username(self) -> str:
+        return self.player.username
+
+
+class DuelCameraSession(Base):
+    __tablename__ = "duel_camera_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    duel_id: Mapped[int] = mapped_column(ForeignKey("duels.id", ondelete="CASCADE"), index=True)
+    player_id: Mapped[int] = mapped_column(ForeignKey(PLAYER_ID_FOREIGN_KEY, ondelete="CASCADE"), index=True)
+    pairing_token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    camera_token_hash: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    pairing_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    paired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    session_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    duel: Mapped[Duel] = relationship(back_populates="camera_sessions")
+    player: Mapped[Player] = relationship(foreign_keys=[player_id])
+
+
+class DuelCard(Base):
+    __tablename__ = "duel_cards"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    duel_id: Mapped[int] = mapped_column(ForeignKey("duels.id", ondelete="CASCADE"), index=True)
+    card_id: Mapped[int] = mapped_column(ForeignKey("cards.id"), index=True)
+    player_id: Mapped[int] = mapped_column(ForeignKey(PLAYER_ID_FOREIGN_KEY), index=True)
+    zone: Mapped[str] = mapped_column(String(24), index=True)
+    position: Mapped[int | None] = mapped_column(Integer)
+    face_down: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    preferred_print_id: Mapped[int | None] = mapped_column(ForeignKey("card_prints.id"))
+    created_by_player_id: Mapped[int] = mapped_column(ForeignKey(PLAYER_ID_FOREIGN_KEY))
+    updated_by_player_id: Mapped[int] = mapped_column(ForeignKey(PLAYER_ID_FOREIGN_KEY))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    client_action_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    duel: Mapped[Duel] = relationship(back_populates="cards")
+    card: Mapped[Card] = relationship()
+    player: Mapped[Player] = relationship(foreign_keys=[player_id])
+    created_by: Mapped[Player] = relationship(foreign_keys=[created_by_player_id])
+    updated_by: Mapped[Player] = relationship(foreign_keys=[updated_by_player_id])
+
+    @property
+    def card_name(self) -> str:
+        return self.card.name
+
+    @property
+    def image_url(self) -> str | None:
+        return self.card.image_url_small or self.card.image_url
+
+    @property
+    def player_username(self) -> str:
+        return self.player.username

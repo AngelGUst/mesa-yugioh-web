@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -138,6 +139,7 @@ class DuelUpdate(BaseModel):
 class DuelEventCreate(BaseModel):
     event_type: str = Field(min_length=1, max_length=50)
     payload: dict | None = None
+    source_device: Literal["web", "camera"] = "web"
 
 
 class DuelEventResponse(BaseModel):
@@ -146,6 +148,105 @@ class DuelEventResponse(BaseModel):
     id: int
     event_type: str
     payload: dict | None
+    actor_player_id: int | None = None
+    actor_username: str | None = None
+    source_device: Literal["web", "camera"] = "web"
+    card_id: int | None = None
+    duel_card_id: int | None = None
+    source_zone: str | None = None
+    target_zone: str | None = None
+    created_at: datetime
+
+
+class DuelCardCreate(BaseModel):
+    card_id: int
+    zone: Literal[
+        "main_deck", "extra_deck", "side_deck", "hand", "monster_zone", "spell_trap_zone",
+        "field_spell", "pendulum", "extra_monster", "graveyard", "banished",
+    ]
+    source_zone: Literal["main_deck", "extra_deck", "side_deck"] = "main_deck"
+    position: int | None = Field(default=None, ge=0, le=4)
+    face_down: bool = False
+    preferred_print_id: int | None = None
+    source_device: Literal["web", "camera"] = "web"
+
+
+class DuelCardMove(BaseModel):
+    zone: Literal[
+        "main_deck", "extra_deck", "side_deck", "hand", "monster_zone", "spell_trap_zone",
+        "field_spell", "pendulum", "extra_monster", "graveyard", "banished",
+    ]
+    position: int | None = Field(default=None, ge=0, le=4)
+    face_down: bool = False
+    source_device: Literal["web", "camera"] = "web"
+
+
+class CameraPairingRedeem(BaseModel):
+    pairing_token: str = Field(min_length=32, max_length=128)
+
+
+class CameraCardPlacement(DuelCardCreate):
+    client_action_id: UUID
+
+
+class CameraDeckCard(BaseModel):
+    card_id: int
+    name: str
+    section: Literal["main", "extra", "side"]
+    quantity: int
+    preferred_print_id: int | None
+    image_url_small: str | None
+
+
+class CameraSessionResponse(BaseModel):
+    camera_token: str
+    expires_at: datetime
+    duel_id: int
+    duel_code: str
+    player_id: int
+    player_username: str
+    deck_cards: list[CameraDeckCard]
+
+
+class CameraSessionInfo(BaseModel):
+    expires_at: datetime
+    duel_id: int
+    duel_code: str
+    player_id: int
+    player_username: str
+    deck_cards: list[CameraDeckCard]
+
+
+class DuelCardResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    card_id: int | None
+    card_name: str
+    image_url: str | None
+    player_id: int
+    player_username: str
+    zone: str
+    position: int | None
+    face_down: bool
+    preferred_print_id: int | None
+    hidden: bool = False
+    hidden: bool = False
+    updated_by_player_id: int
+    updated_at: datetime
+
+
+class DuelSpectatorCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+
+
+class DuelSpectatorResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    player_id: int
+    username: str
+    invited_by_id: int
     created_at: datetime
 
 
@@ -167,7 +268,9 @@ class DuelResponse(BaseModel):
     turn: int
     current_phase: str
     current_player: int
+    revision: int
     winner_id: int | None
+    viewer_role: Literal["player", "spectator"] = "player"
     created_at: datetime
     finished_at: datetime | None
     events: list[DuelEventResponse] = []
