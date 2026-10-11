@@ -307,6 +307,30 @@
     return duelZones.find((item) => item.value === zone)?.label || zone || 'desconocida';
   }
 
+  function fieldOwnerId(own: boolean): number | null {
+    if (!duel || !player) return null;
+    if (isPlayer) return own ? player.id : isPlayer1 ? duel.player2_id : duel.player1_id;
+    return own ? duel.player1_id : duel.player2_id;
+  }
+
+  function cardAt(zone: string, position: number | null, ownerId: number | null, anyOwner = false): DuelCard | undefined {
+    return boardCards.find((card) =>
+      (anyOwner || card.player_id === ownerId) &&
+      card.zone === zone &&
+      (position === null || card.position === position));
+  }
+
+  function countAt(zone: string, ownerId: number | null): number {
+    if (ownerId == null) return 0;
+    return boardCards.filter((card) => card.player_id === ownerId && card.zone === zone).length;
+  }
+
+  function displayCardName(card: DuelCard): string {
+    if (card.face_down) return 'Boca abajo';
+    if (card.hidden) return 'Carta oculta';
+    return card.card_name;
+  }
+
   async function registerBoardCard(event: SubmitEvent) {
     event.preventDefault();
     boardMessage = '';
@@ -570,6 +594,21 @@
     </section>
 
     <!-- TABLERO DIGITAL DE YU-GI-OH! (REGLA MAESTRA / 7 COLUMNAS) -->
+    {#snippet zoneCell(cls, label, zone, position, ownerId, anyOwner = false, badge = '')}
+      {@const card = position === null ? undefined : cardAt(zone, position, ownerId, anyOwner)}
+      {@const total = position === null ? countAt(zone, ownerId) : 0}
+      <div class="zone {cls}" class:occupied={!!card}>
+        {#if badge}<span class="emz-badge">{badge}</span>{/if}
+        {#if card}
+          <strong class="zone-card-name">{displayCardName(card)}</strong>
+          <span class="zone-card-sub">{card.player_username}</span>
+        {:else if position === null && total > 0}
+          <span>{label} ({total})</span>
+        {:else}
+          <span>{label}</span>
+        {/if}
+      </div>
+    {/snippet}
     <section class="board">
       <!-- CAMPO OPONENTE -->
       <div class="field-side opponent-field">
@@ -577,24 +616,24 @@
         
         <!-- Fila Mágicas / Trampas y Decks Oponente -->
         <div class="ygo-grid">
-          <div class="zone deck-zone"><span>DECK</span></div>
-          <div class="zone pendulum-zone red"><span>PÉNDULO<br/>(ROJO)</span></div>
-          <div class="zone spell-zone"><span>MÁGICAS &amp; TRAMPAS</span></div>
-          <div class="zone spell-zone"><span>MÁGICAS &amp; TRAMPAS</span></div>
-          <div class="zone spell-zone"><span>MÁGICAS &amp; TRAMPAS</span></div>
-          <div class="zone pendulum-zone blue"><span>PÉNDULO<br/>(AZUL)</span></div>
-          <div class="zone extra-deck-zone"><span>DECK EXTRA</span></div>
+          {@render zoneCell('deck-zone', 'DECK', 'main_deck', null, fieldOwnerId(false))}
+          {@render zoneCell('pendulum-zone red', 'PÉNDULO (ROJO)', 'pendulum', 1, fieldOwnerId(false))}
+          {@render zoneCell('spell-zone', 'MÁGICAS & TRAMPAS', 'spell_trap_zone', 3, fieldOwnerId(false))}
+          {@render zoneCell('spell-zone', 'MÁGICAS & TRAMPAS', 'spell_trap_zone', 2, fieldOwnerId(false))}
+          {@render zoneCell('spell-zone', 'MÁGICAS & TRAMPAS', 'spell_trap_zone', 1, fieldOwnerId(false))}
+          {@render zoneCell('pendulum-zone blue', 'PÉNDULO (AZUL)', 'pendulum', 0, fieldOwnerId(false))}
+          {@render zoneCell('extra-deck-zone', 'DECK EXTRA', 'extra_deck', null, fieldOwnerId(false))}
         </div>
 
         <!-- Fila Monstruos Oponente -->
         <div class="ygo-grid">
-          <div class="zone grave-zone"><span>CEMENTERIO</span></div>
-          <div class="zone monster-zone"><span>MONSTRUO 5</span></div>
-          <div class="zone monster-zone"><span>MONSTRUO 4</span></div>
-          <div class="zone monster-zone"><span>MONSTRUO 3</span></div>
-          <div class="zone monster-zone"><span>MONSTRUO 2</span></div>
-          <div class="zone monster-zone"><span>MONSTRUO 1</span></div>
-          <div class="zone field-spell-zone"><span>CAMPO</span></div>
+          {@render zoneCell('grave-zone', 'CEMENTERIO', 'graveyard', null, fieldOwnerId(false))}
+          {@render zoneCell('monster-zone', 'MONSTRUO 5', 'monster_zone', 4, fieldOwnerId(false))}
+          {@render zoneCell('monster-zone', 'MONSTRUO 4', 'monster_zone', 3, fieldOwnerId(false))}
+          {@render zoneCell('monster-zone', 'MONSTRUO 3', 'monster_zone', 2, fieldOwnerId(false))}
+          {@render zoneCell('monster-zone', 'MONSTRUO 2', 'monster_zone', 1, fieldOwnerId(false))}
+          {@render zoneCell('monster-zone', 'MONSTRUO 1', 'monster_zone', 0, fieldOwnerId(false))}
+          {@render zoneCell('field-spell-zone', 'CAMPO', 'field_spell', 0, fieldOwnerId(false))}
         </div>
       </div>
 
@@ -603,15 +642,9 @@
         <div class="ygo-grid">
           <div class="empty-cell"></div>
           <div class="empty-cell"></div>
-          <div class="zone extra-monster-zone">
-            <span class="emz-badge">EMZ 1</span>
-            <span>MONSTRUO EXTRA</span>
-          </div>
+          {@render zoneCell('extra-monster-zone', 'MONSTRUO EXTRA', 'extra_monster', 0, null, true, 'EMZ 1')}
           <div class="empty-cell"></div>
-          <div class="zone extra-monster-zone">
-            <span class="emz-badge">EMZ 2</span>
-            <span>MONSTRUO EXTRA</span>
-          </div>
+          {@render zoneCell('extra-monster-zone', 'MONSTRUO EXTRA', 'extra_monster', 1, null, true, 'EMZ 2')}
           <div class="empty-cell"></div>
           <div class="empty-cell"></div>
         </div>
@@ -624,43 +657,37 @@
       <div class="field-side my-field">
         <!-- Fila Monstruos Propio -->
         <div class="ygo-grid">
-          <div class="zone field-spell-zone"><span>ZONA DEL CAMPO</span></div>
-          <div class="zone monster-zone"><span>MONSTRUO 1</span></div>
-          <div class="zone monster-zone"><span>MONSTRUO 2</span></div>
-          <div class="zone monster-zone"><span>MONSTRUO 3</span></div>
-          <div class="zone monster-zone"><span>MONSTRUO 4</span></div>
-          <div class="zone monster-zone"><span>MONSTRUO 5</span></div>
-          <div class="zone grave-zone"><span>CEMENTERIO</span></div>
+          {@render zoneCell('field-spell-zone', 'ZONA DEL CAMPO', 'field_spell', 0, fieldOwnerId(true))}
+          {@render zoneCell('monster-zone', 'MONSTRUO 1', 'monster_zone', 0, fieldOwnerId(true))}
+          {@render zoneCell('monster-zone', 'MONSTRUO 2', 'monster_zone', 1, fieldOwnerId(true))}
+          {@render zoneCell('monster-zone', 'MONSTRUO 3', 'monster_zone', 2, fieldOwnerId(true))}
+          {@render zoneCell('monster-zone', 'MONSTRUO 4', 'monster_zone', 3, fieldOwnerId(true))}
+          {@render zoneCell('monster-zone', 'MONSTRUO 5', 'monster_zone', 4, fieldOwnerId(true))}
+          {@render zoneCell('grave-zone', 'CEMENTERIO', 'graveyard', null, fieldOwnerId(true))}
         </div>
 
         <!-- Fila Mágicas / Trampas y Decks Propio -->
         <div class="ygo-grid">
-          <div class="zone extra-deck-zone"><span>DECK EXTRA</span></div>
-          <div class="zone pendulum-zone blue">
-            <span class="pend-gem blue-gem">⯁</span>
-            <span>PÉNDULO (AZUL)</span>
-          </div>
-          <div class="zone spell-zone"><span>MÁGICAS &amp; TRAMPAS 2</span></div>
-          <div class="zone spell-zone"><span>MÁGICAS &amp; TRAMPAS 3</span></div>
-          <div class="zone spell-zone"><span>MÁGICAS &amp; TRAMPAS 4</span></div>
-          <div class="zone pendulum-zone red">
-            <span class="pend-gem red-gem">⯁</span>
-            <span>PÉNDULO (ROJO)</span>
-          </div>
-          <div class="zone deck-zone"><span>DECK</span></div>
+          {@render zoneCell('extra-deck-zone', 'DECK EXTRA', 'extra_deck', null, fieldOwnerId(true))}
+          {@render zoneCell('pendulum-zone blue', 'PÉNDULO (AZUL)', 'pendulum', 0, fieldOwnerId(true))}
+          {@render zoneCell('spell-zone', 'MÁGICAS & TRAMPAS 2', 'spell_trap_zone', 1, fieldOwnerId(true))}
+          {@render zoneCell('spell-zone', 'MÁGICAS & TRAMPAS 3', 'spell_trap_zone', 2, fieldOwnerId(true))}
+          {@render zoneCell('spell-zone', 'MÁGICAS & TRAMPAS 4', 'spell_trap_zone', 3, fieldOwnerId(true))}
+          {@render zoneCell('pendulum-zone red', 'PÉNDULO (ROJO)', 'pendulum', 1, fieldOwnerId(true))}
+          {@render zoneCell('deck-zone', 'DECK', 'main_deck', null, fieldOwnerId(true))}
         </div>
 
         <!-- Barra inferior: Destierro, Escáner y Mano -->
         <div class="bottom-tools">
-          <div class="zone banish-zone"><span>DESTIERRO (0)</span></div>
+          <div class="zone banish-zone"><span>DESTIERRO ({countAt('banished', fieldOwnerId(true))})</span></div>
           {#if isPlayer}
             <button class="scan-button" on:click={createCameraPairing}>
               📷 Vincular Escáner
             </button>
           {/if}
           <div class="hand">
-            <span>MANO ({myUsername})</span>
-            <i></i><i></i><i></i><i></i><i></i>
+            <span>MANO ({myUsername}) ({countAt('hand', fieldOwnerId(true))})</span>
+            {#each Array.from({ length: Math.min(6, countAt('hand', fieldOwnerId(true))) }) as _, i (i)}<i></i>{/each}
           </div>
         </div>
 
@@ -1004,6 +1031,18 @@
     user-select: none;
     box-sizing: border-box;
   }
+  .zone-card-name {
+    font-size: 8px;
+    font-weight: 700;
+    line-height: 1.25;
+    word-break: break-word;
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .zone-card-sub { font-size: 7px; opacity: 0.85; margin-top: 2px; }
+  .zone.occupied { border-style: solid; filter: brightness(1.3); }
   /* Campo */
   .field-spell-zone {
     border: 2px solid #2e7d32;
