@@ -664,7 +664,15 @@
         <!-- Fila Monstruos Propio -->
         <div class="ygo-grid">
           {@render zoneCell('field-spell-zone', 'ZONA DEL CAMPO', 'field_spell', 0, fieldOwnerId(true))}
-          {@render zoneCell('monster-zone', 'MONSTRUO 1', 'monster_zone', 0, fieldOwnerId(true))}
+          {@const m1 = cardAt('monster_zone', 0, fieldOwnerId(true))}
+          <div class="zone monster-zone" class:occupied={!!m1}>
+            {#if m1}
+              <strong class="zone-card-name">{displayCardName(m1)}</strong>
+              <span class="zone-card-sub">{m1.player_username}</span>
+            {:else}
+              <span>MONSTRUO 1</span>
+            {/if}
+          </div>
           {@render zoneCell('monster-zone', 'MONSTRUO 2', 'monster_zone', 1, fieldOwnerId(true))}
           {@render zoneCell('monster-zone', 'MONSTRUO 3', 'monster_zone', 2, fieldOwnerId(true))}
           {@render zoneCell('monster-zone', 'MONSTRUO 4', 'monster_zone', 3, fieldOwnerId(true))}
@@ -678,7 +686,15 @@
           {@render zoneCell('pendulum-zone blue', 'PÉNDULO (AZUL)', 'pendulum', 0, fieldOwnerId(true))}
           {@render zoneCell('spell-zone', 'MÁGICAS & TRAMPAS 2', 'spell_trap_zone', 1, fieldOwnerId(true))}
           {@render zoneCell('spell-zone', 'MÁGICAS & TRAMPAS 3', 'spell_trap_zone', 2, fieldOwnerId(true))}
-          {@render zoneCell('spell-zone', 'MÁGICAS & TRAMPAS 4', 'spell_trap_zone', 3, fieldOwnerId(true))}
+          {@const s4 = cardAt('spell_trap_zone', 3, fieldOwnerId(true))}
+          <div class="zone spell-zone" class:occupied={!!s4}>
+            {#if s4}
+              <strong class="zone-card-name">{displayCardName(s4)}</strong>
+              <span class="zone-card-sub">{s4.player_username}</span>
+            {:else}
+              <span>MÁGICAS & TRAMPAS 4</span>
+            {/if}
+          </div>
           {@render zoneCell('pendulum-zone red', 'PÉNDULO (ROJO)', 'pendulum', 1, fieldOwnerId(true))}
           {@render zoneCell('deck-zone', 'DECK', 'main_deck', null, fieldOwnerId(true))}
         </div>
