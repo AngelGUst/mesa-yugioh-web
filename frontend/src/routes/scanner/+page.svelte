@@ -3,7 +3,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { createWorker } from 'tesseract.js';
-  import { MAT_COLUMNS, MAT_ROWS, MAT_WIDTH_CM, MAT_HEIGHT_CM, cellAtMatPoint, matCellForZonePosition, slotsForZone } from '$lib/config/board';
+  import { MAT_COLUMNS, MAT_ROWS, MAT_WIDTH_CM, MAT_HEIGHT_CM, MAT_LAYOUT, cellAtMatPoint, matCellForZonePosition, slotsForZone, type MatCell } from '$lib/config/board';
   import {
     cameraFetch,
     clearCameraToken,
@@ -67,6 +67,8 @@
   let markerCount = 0;
   let missingMarkerNames = Object.values(markerNames);
   let calibration: number[] | null = null;
+  let lastCalibration: number[] | null = null;
+  let lastCalibrationAt = 0;
   let capturedCalibration: number[] | null = null;
   let capturePanelElement: HTMLElement;
   let capturedImage = '';
@@ -80,6 +82,9 @@
   let faceDown = false;
   let useCurrentCanvas = false;
   let autoCapture = true;
+  let scanMode: 'hand' | 'mounted' = 'hand';
+  let ocrConfidence = 0;
+  let ocrMargin = 0;
   let appVersion = '';
   $: boardCardCount = boardCards.length;
   $: monsterTaken = boardCards
@@ -90,6 +95,8 @@
   let lastAutoCaptureAt = 0;
   let lastAutoCellKey = '';
   let lastBoardRefresh = 0;
+  let pendingCells = new Set<string>();
+  let cellWasPresent = new Map<string, boolean>();
   const AUTO_STABLE_FRAMES = 4;
   const AUTO_MOVE_TOLERANCE_PX = 6;
   const AUTO_COOLDOWN_MS = 4000;
@@ -202,13 +209,17 @@
         audio: false,
         video: {
           facingMode: { ideal: 'environment' },
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
         }
       });
       videoElement.srcObject = stream;
       await videoElement.play();
       const [track] = stream.getVideoTracks();
+      try {
+        await track.applyConstraints({ advanced: [{ focusMode: 'continuous' } as any] });
+      } catch {}
+      try { await (navigator as any).wakeLock?.request('screen'); } catch {}
       track.addEventListener('ended', () => {
         calibration = null;
         cameraError = 'La cámara se desconectó. Reiníciala y vuelve a calibrar.';
@@ -237,7 +248,8 @@
       busy = true;
       lastDetection = timestamp;
       try {
-        const width = 640;
+        const useHighRes = markerCount < 4;
+        const width = useHighRes ? 800 : 640;
         const height = Math.max(1, Math.round(width * videoElement.videoHeight / videoElement.videoWidth));
         processCanvas.width = width;
         processCanvas.height = height;
@@ -253,10 +265,23 @@
         const points = detectedMarkerCenters(detections);
         markerCount = points.size;
         missingMarkerNames = markerIds.filter((id) => !points.has(id)).map((id) => markerNames[id]);
-        calibration = points.size === 4 ? calibrateMarkers(points, width, height) : null;
-        if (Date.now() - lastBoardRefresh > 5000 && !isCapturing && !isRecognizing && !capturedImage) {
+        const freshCalibration = points.size === 4 ? calibrateMarkers(points, width, height) : null;
+        if (freshCalibration) {
+          lastCalibration = freshCalibration;
+          lastCalibrationAt = Date.now();
+          calibration = freshCalibration;
+        } else if (lastCalibration && Date.now() - lastCalibrationAt < 1200) {
+          calibration = [...lastCalibration];
+        } else {
+          calibration = null;
+        }
+        if (Date.now() - lastBoardRefresh > 2000 && !isCapturing && !isRecognizing && !capturedImage) {
           lastBoardRefresh = Date.now();
-          loadCameraBoardCards().then((cards) => { boardCards = cards; }).catch(() => {});
+          loadCameraBoardCards().then((cards) => {
+            boardCards = cards;
+            const occupiedKeys = new Set(cards.filter((card) => card.position !== null).map((card) => `${card.zone}:${card.position}`));
+            for (const key of pendingCells) if (occupiedKeys.has(key)) pendingCells.delete(key);
+          }).catch(() => {});
         }
         const occupiedCells = boardCards
           .filter((card) => card.position !== null && (card.zone === 'extra_monster' || card.player_id === session?.player_id))
@@ -267,7 +292,7 @@
           : points.size === 4
             ? 'Se ven los 4 marcadores, pero su geometría no permite calibrar.'
             : `Marcadores detectados: ${markerCount}/4`;
-        drawOverlay(overlayContext, width, height, detections, calibration, occupiedCells);
+        drawOverlay(overlayContext, width, height, detections, calibration ?? lastCalibration, occupiedCells);
         maybeAutoCapture(points, width, height);
       } catch (error) {
         cameraError = error instanceof Error ? error.message : 'Falló la detección de marcadores.';
@@ -361,6 +386,35 @@
     return cellAtMatPoint(mat.x * MAT_WIDTH_CM, mat.y * MAT_HEIGHT_CM);
   }
 
+  function cellEdgeDensity(matrix: number[], row: number, column: number, width: number, height: number): number {
+    const ctx = processCanvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return 0;
+    const image = ctx.getImageData(0, 0, width, height);
+    const samples = 16;
+    let total = 0;
+    let count = 0;
+    for (let sy = 0; sy < samples; sy++) {
+      for (let sx = 0; sx < samples; sx++) {
+        const u = (column + (sx + 0.5) / samples) / MAT_COLUMNS;
+        const v = (row + (sy + 0.5) / samples) / MAT_ROWS;
+        const p = projectPoint(matrix, u, v);
+        if (!p) continue;
+        const x = Math.floor(p.x);
+        const y = Math.floor(p.y);
+        if (x < 1 || y < 1 || x >= width - 1 || y >= height - 1) continue;
+        const idx = (y * width + x) * 4;
+        const rightIdx = (y * width + (x + 1)) * 4;
+        const downIdx = ((y + 1) * width + x) * 4;
+        const gx = Math.abs(image.data[idx] - image.data[rightIdx]);
+        const gy = Math.abs(image.data[idx] - image.data[downIdx]);
+        total += gx + gy;
+        count++;
+      }
+    }
+    if (!count) return 0;
+    return total / (count * 255 * 2);
+  }
+
   function drawOverlay(
     context: CanvasRenderingContext2D,
     width: number,
@@ -444,11 +498,15 @@
     }
     context.fillStyle = '#fff';
     context.fillText('TAPETE CALIBRADO', 12, 22);
+    context.font = '11px sans-serif';
+    context.fillText(`OCR conf: ${ocrConfidence.toFixed(0)}%  margen: ${ocrMargin.toFixed(2)}`, 12, 38);
+    context.fillText(`Modo: ${scanMode}  marcadores: ${markerCount}/4`, 12, 52);
   }
 
   function maybeAutoCapture(points: Map<number, Point>, width: number, height: number) {
-    if (!autoCapture || !calibration || isCapturing || isRecognizing || capturedImage) {
-      if (!calibration) { stableFrames = 0; previousCenters = null; }
+    const activeCalibration = calibration ?? (Date.now() - lastCalibrationAt < 1200 ? lastCalibration : null);
+    if (!autoCapture || !activeCalibration || isCapturing || isRecognizing || capturedImage) {
+      if (!activeCalibration) { stableFrames = 0; previousCenters = null; }
       return;
     }
     let maxMove = Number.POSITIVE_INFINITY;
@@ -462,17 +520,57 @@
     }
     previousCenters = new Map(points);
     stableFrames = maxMove <= AUTO_MOVE_TOLERANCE_PX ? stableFrames + 1 : 0;
-    if (stableFrames < AUTO_STABLE_FRAMES) return;
-    if (Date.now() - lastAutoCaptureAt < AUTO_COOLDOWN_MS) return;
-    const detected = detectCellAtCenter(calibration, width, height)?.cell ?? null;
-    if (!detected) return;
-    const cellKey = `${detected.zone}:${detected.position}`;
-    if (cellKey === lastAutoCellKey) return;
-    if (slotsForZone(detected.zone) > 0 && availablePositionsForZone(detected.zone).length === 0) return;
+    if (stableFrames < AUTO_STABLE_FRAMES && scanMode === 'hand') return;
+    if (Date.now() - lastAutoCaptureAt < 1500) return;
+
+    if (!activeCalibration) return;
+
+    if (scanMode === 'mounted') {
+      for (let row = 0; row < MAT_ROWS; row++) {
+        for (let column = 0; column < MAT_COLUMNS; column++) {
+          const cell = MAT_LAYOUT[row][column];
+          if (!cell) continue;
+          const cellKey = `${cell.zone}:${cell.position}`;
+          const isOccupied = boardCards.some((card) =>
+            card.zone === cell.zone && card.position === cell.position &&
+            (cell.zone === 'extra_monster' || card.player_id === session?.player_id)
+          );
+          if (isOccupied || pendingCells.has(cellKey)) continue;
+          if (slotsForZone(cell.zone) > 0 && !availablePositionsForZone(cell.zone).includes(cell.position + 1)) continue;
+          const density = cellEdgeDensity(activeCalibration, row, column, width, height);
+          const present = density >= 0.06;
+          const wasPresent = cellWasPresent.get(cellKey) ?? false;
+          cellWasPresent.set(cellKey, present);
+          if (present && !wasPresent) {
+            lastAutoCaptureAt = Date.now();
+            pendingCells.add(cellKey);
+            void captureCard(cell, row, column);
+            return;
+          }
+        }
+      }
+      return;
+    }
+
+    const detected = detectCellAtCenter(activeCalibration, width, height);
+    const detectedCell = detected?.cell ?? null;
+    if (!detectedCell || !detected) return;
+    const cellKey = `${detectedCell.zone}:${detectedCell.position}`;
+    if (pendingCells.has(cellKey)) return;
+    const isOccupied = boardCards.some((card) =>
+      card.zone === detectedCell.zone && card.position === detectedCell.position &&
+      (detectedCell.zone === 'extra_monster' || card.player_id === session?.player_id)
+    );
+    if (isOccupied) return;
+    if (slotsForZone(detectedCell.zone) > 0 && availablePositionsForZone(detectedCell.zone).length === 0) return;
+    const density = cellEdgeDensity(activeCalibration, detected.row, detected.column, width, height);
+    if (density < 0.06) return;
+    if (cellKey === lastAutoCellKey && Date.now() - lastAutoCaptureAt < 4000) return;
     lastAutoCellKey = cellKey;
     lastAutoCaptureAt = Date.now();
     stableFrames = 0;
-    void captureCard();
+    pendingCells.add(cellKey);
+    void captureCard(detectedCell, detected.row, detected.column);
   }
 
   function discardCapture() {
@@ -484,9 +582,12 @@
     lastAutoCaptureAt = Date.now();
   }
 
-  async function captureCard() {
+  async function captureCard(targetCell?: MatCell, targetRow?: number, targetColumn?: number) {
     cameraError = '';
     captureMessage = '';
+    if ((!calibration || calibration === null) && lastCalibration && Date.now() - lastCalibrationAt < 1200) {
+      calibration = [...lastCalibration];
+    }
     if (!calibration || !stream || videoElement.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
       cameraError = 'Se perdieron los marcadores o la cámara. Recupera la calibración antes de capturar.';
       return;
@@ -494,14 +595,26 @@
     capturedCalibration = [...calibration];
     const procWidth = overlayCanvas?.width || 640;
     const procHeight = overlayCanvas?.height || 480;
-    const detection = detectCellAtCenter(calibration, procWidth, procHeight);
+    const detection = targetCell && targetRow !== undefined && targetColumn !== undefined
+      ? { row: targetRow, column: targetColumn, cell: targetCell }
+      : detectCellAtCenter(calibration, procWidth, procHeight);
     const detectedCell = detection?.cell ?? null;
     try { boardCards = await loadCameraBoardCards(); } catch {}
     if (detectedCell) {
       const free = availablePositionsForZone(detectedCell.zone);
       selectedZone = detectedCell.zone;
       const wanted = detectedCell.position + 1;
-      selectedPosition = slotsForZone(detectedCell.zone) === 0 ? 0 : free.includes(wanted) ? wanted : free[0] || 0;
+      if (slotsForZone(detectedCell.zone) > 0) {
+        if (!free.includes(wanted)) {
+          cameraError = `La celda ${detectedCell.label} ya está ocupada. Elige un slot libre o mueve la carta.`;
+          isCapturing = false;
+          isRecognizing = false;
+          return;
+        }
+        selectedPosition = wanted;
+      } else {
+        selectedPosition = 0;
+      }
     }
     const canvas = document.createElement('canvas');
     canvas.width = videoElement.videoWidth;
@@ -519,12 +632,56 @@
     isRecognizing = true;
     try {
       if (!ocrWorker) ocrWorker = await createWorker('eng');
-      const ocrSource = detection ? cropCellCanvas(canvas, capturedCalibration, detection.row, detection.column, procWidth, procHeight) ?? canvas : canvas;
-      const result = await ocrWorker.recognize(ocrSource);
-      ocrText = result.data.text.trim();
+      const warped = detection ? warpCellCanvas(canvas, capturedCalibration, detection.row, detection.column, procWidth, procHeight, 640, 928) : null;
+      const ocrSource = warped ?? canvas;
+
+      // Title band (top ~6-22% of the warped card)
+      let titleCanvas = ocrSource;
+      if (warped) {
+        titleCanvas = cropRegionCanvas(warped, 0, warped.height * 0.05, warped.width, warped.height * 0.18) ?? warped;
+      }
+      const titleGray = preprocessForOcr(titleCanvas);
+      const titleResult = await ocrWorker.recognize(titleGray, { tessedit_pageseg_mode: '7' });
+      let bestText = titleResult.data.text.trim();
+      ocrConfidence = titleResult.data.confidence || 0;
+
+      // Fallback: full warped card with sparse text if title gave nothing useful
+      if (bestText.replace(/[^a-z0-9]/gi, '').length < 4) {
+        const fullGray = preprocessForOcr(ocrSource);
+        const fullResult = await ocrWorker.recognize(fullGray, { tessedit_pageseg_mode: '11' });
+        if ((fullResult.data.confidence || 0) > ocrConfidence) {
+          bestText = fullResult.data.text.trim();
+          ocrConfidence = fullResult.data.confidence || 0;
+        }
+      }
+
+      // Passcode region (bottom-left 8 digits)
+      let passcodeMatch: CameraDeckCard | null = null;
+      if (warped) {
+        const passcodeCanvas = cropRegionCanvas(warped, 0, warped.height * 0.86, warped.width * 0.45, warped.height * 0.14);
+        if (passcodeCanvas) {
+          const passcodeGray = preprocessForOcr(passcodeCanvas);
+          const passcodeResult = await ocrWorker.recognize(passcodeGray, { tessedit_pageseg_mode: '7', tessedit_char_whitelist: '0123456789' });
+          const digits = (passcodeResult.data.text || '').replace(/[^0-9]/g, '');
+          if (digits.length >= 6) {
+            const found = (session?.deck_cards || []).find((card) => card.passcode && String(card.passcode).includes(digits.slice(0, 8)));
+            if (found) passcodeMatch = found;
+          }
+        }
+      }
+
+      ocrText = bestText;
       suggestions = rankDeckCandidates(ocrText, session?.deck_cards || []);
+      if (passcodeMatch && !suggestions.some((item) => item.card.card_id === passcodeMatch!.card_id)) {
+        suggestions = [{ card: passcodeMatch, score: 0 }, ...suggestions].slice(0, 5);
+      }
       if (suggestions.length) selectedCardId = String(suggestions[0].card.card_id);
-      if (autoCapture && suggestions.length && suggestions[0].score <= AUTO_CONFIRM_MAX_SCORE && selectedCardId) {
+      const topScore = suggestions.length ? suggestions[0].score : 1;
+      const canAutoConfirm = autoCapture && suggestions.length > 0 && selectedCardId
+        && (passcodeMatch !== null || (topScore <= 0.12 || (topScore <= 0.18 && ocrMargin >= 0.08)))
+        && ocrConfidence >= 50
+        && (suggestions[0].card.name || '').length >= 5;
+      if (canAutoConfirm) {
         await confirmCardAction();
         return;
       }
@@ -539,43 +696,175 @@
     }
   }
 
-  function cropCellCanvas(
+  function warpCellCanvas(
     full: HTMLCanvasElement,
     matrix: number[],
     row: number,
     column: number,
     procWidth: number,
-    procHeight: number
+    procHeight: number,
+    targetWidth = 640,
+    targetHeight = 928
   ): HTMLCanvasElement | null {
-    const scaleX = full.width / procWidth;
-    const scaleY = full.height / procHeight;
-    const corners = [
-      [column / MAT_COLUMNS, row / MAT_ROWS],
-      [(column + 1) / MAT_COLUMNS, row / MAT_ROWS],
-      [(column + 1) / MAT_COLUMNS, (row + 1) / MAT_ROWS],
-      [column / MAT_COLUMNS, (row + 1) / MAT_ROWS]
-    ].map(([u, v]) => projectPoint(matrix, u, v));
-    if (corners.some((point) => point === null)) return null;
-    const xs = corners.map((point) => point!.x * scaleX);
-    const ys = corners.map((point) => point!.y * scaleY);
-    const marginX = (Math.max(...xs) - Math.min(...xs)) * 0.15;
-    const marginY = (Math.max(...ys) - Math.min(...ys)) * 0.15;
-    const sourceX = Math.max(0, Math.floor(Math.min(...xs) - marginX));
-    const sourceY = Math.max(0, Math.floor(Math.min(...ys) - marginY));
-    const sourceWidth = Math.min(full.width - sourceX, Math.ceil(Math.max(...xs) + marginX) - sourceX);
-    const sourceHeight = Math.min(full.height - sourceY, Math.ceil(Math.max(...ys) + marginY) - sourceY);
-    if (sourceWidth < 40 || sourceHeight < 40) return null;
-    const cropped = document.createElement('canvas');
-    cropped.width = sourceWidth * 2;
-    cropped.height = sourceHeight * 2;
-    const croppedContext = cropped.getContext('2d');
-    if (!croppedContext) return null;
-    croppedContext.drawImage(full, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, cropped.width, cropped.height);
-    return cropped;
+    const fullContext = full.getContext('2d');
+    if (!fullContext) return null;
+    const fullImage = fullContext.getImageData(0, 0, full.width, full.height);
+    const out = document.createElement('canvas');
+    out.width = targetWidth;
+    out.height = targetHeight;
+    const outContext = out.getContext('2d');
+    if (!outContext) return null;
+    const outImage = outContext.createImageData(targetWidth, targetHeight);
+
+    const u0 = column / MAT_COLUMNS;
+    const v0 = row / MAT_ROWS;
+    const uStep = 1 / (MAT_COLUMNS * targetWidth);
+    const vStep = 1 / (MAT_ROWS * targetHeight);
+
+    for (let ty = 0; ty < targetHeight; ty++) {
+      for (let tx = 0; tx < targetWidth; tx++) {
+        const u = u0 + tx / (MAT_COLUMNS * targetWidth);
+        const v = v0 + ty / (MAT_ROWS * targetHeight);
+        const point = projectPoint(matrix, u, v);
+        if (!point) continue;
+        const scaleX = full.width / procWidth;
+        const scaleY = full.height / procHeight;
+        const sx = point.x * scaleX;
+        const sy = point.y * scaleY;
+        // sample with bilinear from full image (coordinates already in full pixels)
+        const x0 = Math.floor(sx);
+        const y0 = Math.floor(sy);
+        const x1 = Math.min(full.width - 1, x0 + 1);
+        const y1 = Math.min(full.height - 1, y0 + 1);
+        if (x0 < 0 || y0 < 0 || x0 >= full.width || y0 >= full.height) continue;
+        const fx = sx - x0;
+        const fy = sy - y0;
+        const idx = (ty * targetWidth + tx) * 4;
+        for (let channel = 0; channel < 3; channel++) {
+          const v00 = fullImage.data[(y0 * full.width + x0) * 4 + channel];
+          const v10 = fullImage.data[(y0 * full.width + x1) * 4 + channel];
+          const v01 = fullImage.data[(y1 * full.width + x0) * 4 + channel];
+          const v11 = fullImage.data[(y1 * full.width + x1) * 4 + channel];
+          outImage.data[idx + channel] = Math.round(
+            v00 * (1 - fx) * (1 - fy) + v10 * fx * (1 - fy) + v01 * (1 - fx) * fy + v11 * fx * fy
+          );
+        }
+        outImage.data[idx + 3] = 255;
+      }
+    }
+    outContext.putImageData(outImage, 0, 0);
+    return out;
+  }
+
+  function preprocessForOcr(source: HTMLCanvasElement): HTMLCanvasElement {
+    const out = document.createElement('canvas');
+    out.width = source.width;
+    out.height = source.height;
+    const ctx = out.getContext('2d');
+    if (!ctx) return source;
+    ctx.drawImage(source, 0, 0);
+    const image = ctx.getImageData(0, 0, out.width, out.height);
+    // grayscale + contrast stretch
+    let min = 255, max = 0;
+    for (let i = 0; i < image.data.length; i += 4) {
+      const gray = Math.round(image.data[i] * 0.299 + image.data[i + 1] * 0.587 + image.data[i + 2] * 0.114);
+      image.data[i] = image.data[i + 1] = image.data[i + 2] = gray;
+      if (gray < min) min = gray;
+      if (gray > max) max = gray;
+    }
+    const range = Math.max(1, max - min);
+    for (let i = 0; i < image.data.length; i += 4) {
+      const gray = Math.round(((image.data[i] - min) / range) * 255);
+      image.data[i] = image.data[i + 1] = image.data[i + 2] = gray;
+    }
+    ctx.putImageData(image, 0, 0);
+    return out;
+  }
+
+  function binarizeForOcr(source: HTMLCanvasElement): HTMLCanvasElement {
+    const gray = preprocessForOcr(source);
+    const ctx = gray.getContext('2d');
+    if (!ctx) return gray;
+    const image = ctx.getImageData(0, 0, gray.width, gray.height);
+    // Otsu threshold
+    const histogram = new Array(256).fill(0);
+    for (let i = 0; i < image.data.length; i += 4) histogram[image.data[i]]++;
+    const total = image.data.length / 4;
+    let sum = 0;
+    for (let t = 0; t < 256; t++) sum += t * histogram[t];
+    let sumB = 0, wB = 0, maxVariance = 0, threshold = 128;
+    for (let t = 0; t < 256; t++) {
+      wB += histogram[t];
+      if (wB === 0) continue;
+      const wF = total - wB;
+      if (wF === 0) break;
+      sumB += t * histogram[t];
+      const mB = sumB / wB;
+      const mF = (sum - sumB) / wF;
+      const variance = wB * wF * (mB - mF) ** 2;
+      if (variance > maxVariance) { maxVariance = variance; threshold = t; }
+    }
+    for (let i = 0; i < image.data.length; i += 4) {
+      const value = image.data[i] > threshold ? 255 : 0;
+      image.data[i] = image.data[i + 1] = image.data[i + 2] = value;
+    }
+    ctx.putImageData(image, 0, 0);
+    return gray;
+  }
+
+  function cropRegionCanvas(source: HTMLCanvasElement, x: number, y: number, width: number, height: number): HTMLCanvasElement | null {
+    const out = document.createElement('canvas');
+    out.width = Math.max(1, Math.round(width));
+    out.height = Math.max(1, Math.round(height));
+    const ctx = out.getContext('2d');
+    if (!ctx) return null;
+    ctx.drawImage(source, x, y, width, height, 0, 0, out.width, out.height);
+    return out;
   }
 
   function normalizeText(value: string): string {
     return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  }
+
+  const OCR_CONFUSIONS: Record<string, string> = {
+    '0': 'o', '1': 'i', '2': 'z', '5': 's', '6': 'g', '8': 'b',
+    'rn': 'm', 'vv': 'w', 'cl': 'd', 'ii': 'n'
+  };
+
+  function confusionNormalize(value: string): string {
+    let result = normalizeText(value);
+    for (const [from, to] of Object.entries(OCR_CONFUSIONS)) {
+      result = result.split(from).join(to);
+    }
+    return result;
+  }
+
+  function bestWindowDistance(text: string, pattern: string): number {
+    if (!pattern) return 0;
+    if (!text) return pattern.length;
+    const m = pattern.length;
+    let best = pattern.length;
+    const minLen = Math.max(2, m - 3);
+    const maxLen = m + 3;
+    for (let start = 0; start < text.length; start++) {
+      for (let len = minLen; len <= maxLen; len++) {
+        const end = start + len;
+        if (end > text.length) break;
+        const slice = text.slice(start, end);
+        const dist = editDistance(slice, pattern);
+        if (dist < best) best = dist;
+      }
+    }
+    return best;
+  }
+
+  function tokenJaccard(left: string, right: string): number {
+    const leftTokens = new Set(left.split(/[^a-z0-9]+/).filter((token) => token.length > 1));
+    const rightTokens = new Set(right.split(/[^a-z0-9]+/).filter((token) => token.length > 1));
+    if (!leftTokens.size || !rightTokens.size) return 0;
+    let intersection = 0;
+    for (const token of leftTokens) if (rightTokens.has(token)) intersection++;
+    return intersection / (leftTokens.size + rightTokens.size - intersection);
   }
 
   function editDistance(left: string, right: string): number {
@@ -593,15 +882,30 @@
   }
 
   function rankDeckCandidates(text: string, cards: CameraDeckCard[]): Suggestion[] {
-    const source = normalizeText(text);
-    if (source.length < 4) return [];
-    return cards.map((card) => {
-      const name = normalizeText(card.name);
-      const foundAt = source.indexOf(name);
-      const distance = editDistance(source.slice(Math.max(0, foundAt), foundAt >= 0 ? foundAt + name.length : source.length), name);
-      const score = foundAt >= 0 ? 0 : distance / Math.max(source.length, name.length, 1);
+    const source = confusionNormalize(text);
+    if (source.length < 3) return [];
+    const seen = new Set<number>();
+    const deduped = cards.filter((card) => {
+      if (seen.has(card.card_id)) return false;
+      seen.add(card.card_id);
+      return true;
+    });
+    const ranked = deduped.map((card) => {
+      const name = confusionNormalize(card.name);
+      const windowDist = bestWindowDistance(source, name);
+      const editScore = windowDist / Math.max(name.length, 1);
+      const jaccard = tokenJaccard(source, name);
+      const tokenScore = 1 - jaccard;
+      const score = Math.min(editScore, tokenScore);
       return { card, score };
-    }).filter((item) => item.score <= 0.62).sort((a, b) => a.score - b.score).slice(0, 5);
+    });
+    const sorted = ranked.filter((item) => item.score <= 0.65).sort((a, b) => a.score - b.score).slice(0, 5);
+    if (sorted.length >= 2) {
+      ocrMargin = Math.max(0, sorted[1].score - sorted[0].score);
+    } else {
+      ocrMargin = sorted.length === 1 ? 1 : 0;
+    }
+    return sorted;
   }
 
   function availablePositionsForZone(zoneValue: string): number[] {
@@ -735,6 +1039,9 @@
             <button type="button" class="secondary" on:click={() => (autoCapture = !autoCapture)} aria-pressed={autoCapture} title="Dispara la captura solo cuando el teléfono está quieto sobre una celda">
               Auto: {autoCapture ? 'ON' : 'OFF'}
             </button>
+            <button type="button" class="secondary" on:click={() => (scanMode = scanMode === 'hand' ? 'mounted' : 'hand')} aria-pressed={scanMode === 'mounted'} title="Mano: apuntas la cruz. Montado: vigila todas las celdas libres.">
+              Modo: {scanMode === 'hand' ? 'Mano' : 'Montado'}
+            </button>
             <button type="button" class="primary" on:click={captureCard} disabled={!isCalibrated || isCapturing || isRecognizing}>
               {isCapturing ? 'Capturando…' : isRecognizing ? 'Leyendo carta…' : 'Capturar carta'}
             </button>
@@ -777,7 +1084,7 @@
           <button type="button" class="text-button" on:click={discardCapture}>Descartar captura</button>
         {:else}
           <p>{autoCapture ? 'Mantén el teléfono quieto con la cruz sobre la carta y la captura se dispara sola.' : 'Cuando los cuatro marcadores estén visibles, captura la carta.'} La lectura solo propone una coincidencia; no modifica la partida hasta que confirmes.</p>
-          <p class="board-debug">Tablero: {boardCardCount} carta(s) · monstruos ocupados: {monsterTaken.length ? monsterTaken.join(', ') : 'ninguno'}{#if ocrText} · texto leído: {ocrText.length} caracteres{/if}</p>
+          <p class="board-debug">Tablero: {boardCardCount} carta(s) · OCR conf: {ocrConfidence.toFixed(0)}% · margen: {ocrMargin.toFixed(2)} · modo: {scanMode}{#if ocrText} · texto leído: {ocrText.length} caracteres{/if}</p>
         {/if}
         {#if captureMessage}<p class="success-message" role="status">{captureMessage}</p>{/if}
       </section>

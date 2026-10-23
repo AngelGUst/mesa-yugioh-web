@@ -196,6 +196,7 @@ class CameraDeckCard(BaseModel):
     quantity: int
     preferred_print_id: int | None
     image_url_small: str | None
+    passcode: int | None = None
 
 
 class CameraSessionResponse(BaseModel):

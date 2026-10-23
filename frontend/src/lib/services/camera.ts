@@ -9,6 +9,7 @@ export interface CameraDeckCard {
   quantity: number;
   preferred_print_id: number | null;
   image_url_small: string | null;
+  passcode: number | null;
 }
 
 export interface CameraSession {

@@ -461,6 +461,7 @@ def _camera_deck_cards(duel: Duel, player: Player, db: Session) -> list[CameraDe
             quantity=entry.quantity,
             preferred_print_id=entry.preferred_print_id,
             image_url_small=entry.card.image_url_small,
+            passcode=entry.card.ygoprodeck_id,
         )
         for entry in entries
     ]
